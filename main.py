@@ -111,7 +111,7 @@ def on_discussion(username: str, topic: str, payload):
 
 async def main():
     nexus = NexusClient.from_api_key(VK_URL, MQTT_HOST, SERVICE_USERNAME, SERVICE_API_KEY, MQTT_PORT)
-    nexus.subscribe("common/user_connected", lambda t, p: asyncio.get_event_loop().create_task(on_user_connected(t, p)))
+    nexus.subscribe("common/user_connected", on_user_connected)
     nexus.start_listening()
     logger.info(f"Profiler démarré — écoute common/user_connected")
     await asyncio.Event().wait()

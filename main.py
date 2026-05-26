@@ -121,12 +121,15 @@ async def on_discussion(username: str, topic: str, payload):
         session_id = (await resp.json())["session_id"]
     logger.info(f"[{username}] Session {session_id} stockée dans mnemonic")
 
+    logger.info(f"[{username}] Extraction des faits en cours...")
     facts = await _extract_facts(payload)
     if not facts:
         logger.info(f"[{username}] Aucun fait extrait")
         return
 
-    logger.info(f"[{username}] {len(facts)} faits extraits: {facts}")
+    logger.info(f"[{username}] {len(facts)} faits extraits:")
+    for fact in facts:
+        logger.info(f"[{username}]   {fact['type']}: {fact['value']}")
 
     async with aiohttp.ClientSession(headers=auth_headers) as http:
         resp = await http.post(
@@ -134,6 +137,7 @@ async def on_discussion(username: str, topic: str, payload):
             json={"facts": facts, "session_id": session_id},
         )
         resp.raise_for_status()
+    logger.info(f"[{username}] Faits enregistrés dans mnemonic")
 
 
 async def on_user_connected(topic: str, payload):

@@ -1,1 +1,3 @@
 git+https://github.com/FCare/nexus-client.git@master
+openai>=1.0.0
+aiohttp>=3.8.0

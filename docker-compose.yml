@@ -9,6 +9,10 @@ services:
       MQTT_PORT: ${MQTT_PORT:-1883}
       MQTT_SERVICE_USERNAME: ${MQTT_SERVICE_USERNAME}
       MQTT_SERVICE_API_KEY: ${MQTT_SERVICE_API_KEY}
+      MNEMONIC_URL: ${MNEMONIC_URL:-http://mnemonic:8000}
+      LLM_BASE_URL: ${LLM_BASE_URL}
+      LLM_MODEL: ${LLM_MODEL:-qwen3-vl-8b-instruct}
+      LLAMACPP_API_KEY: ${LLAMACPP_API_KEY}
     networks:
       - ansible
     restart: unless-stopped

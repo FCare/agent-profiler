@@ -27,6 +27,8 @@ LLAMACPP_API_KEY = os.environ.get("LLAMACPP_API_KEY", "no-key")
 
 AGENT_NAME = "profiler"
 
+_subscribed_users: set[str] = set()
+
 FACT_TYPES = [
     "name", "location", "occupation", "family", "language", "skill",
     "cuisine", "music", "sport", "video_game", "technology", "politics",
@@ -151,6 +153,11 @@ async def on_user_connected(topic: str, payload):
     if not discussions_topic or not agent_topics_topic:
         logger.warning(f"Topics manquants pour {username}, skip")
         return
+
+    if username in _subscribed_users:
+        logger.debug(f"Utilisateur {username} déjà abonné, skip")
+        return
+    _subscribed_users.add(username)
 
     logger.info(f"Nouvel utilisateur: {username} — discussions={discussions_topic}")
 

@@ -111,11 +111,13 @@ async def on_discussion(username: str, topic: str, payload, user_api_key: str):
     logger.info(f"[{username}] Discussion reçue ({len(payload)} messages)")
 
     auth_headers = {"X-API-Key": user_api_key}
+    sessions_url = f"{MNEMONIC_URL}/users/{username}/sessions"
+    logger.info(f"[{username}] POST {sessions_url} — X-API-Key: {user_api_key}")
 
     try:
         async with aiohttp.ClientSession(headers=auth_headers) as http:
             resp = await http.post(
-                f"{MNEMONIC_URL}/users/{username}/sessions",
+                sessions_url,
                 json={"messages": payload},
             )
             resp.raise_for_status()

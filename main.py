@@ -112,14 +112,18 @@ async def on_discussion(username: str, topic: str, payload):
 
     auth_headers = {"X-API-Key": SERVICE_API_KEY}
 
-    async with aiohttp.ClientSession(headers=auth_headers) as http:
-        resp = await http.post(
-            f"{MNEMONIC_URL}/users/{username}/sessions",
-            json={"messages": payload},
-        )
-        resp.raise_for_status()
-        session_id = (await resp.json())["session_id"]
-    logger.info(f"[{username}] Session {session_id} stockée dans mnemonic")
+    try:
+        async with aiohttp.ClientSession(headers=auth_headers) as http:
+            resp = await http.post(
+                f"{MNEMONIC_URL}/users/{username}/sessions",
+                json={"messages": payload},
+            )
+            resp.raise_for_status()
+            session_id = (await resp.json())["session_id"]
+        logger.info(f"[{username}] Session {session_id} stockée dans mnemonic")
+    except Exception as e:
+        logger.error(f"[{username}] Échec stockage session dans mnemonic: {e}")
+        return
 
     logger.info(f"[{username}] Extraction des faits en cours...")
     facts = await _extract_facts(payload)
@@ -131,13 +135,16 @@ async def on_discussion(username: str, topic: str, payload):
     for fact in facts:
         logger.info(f"[{username}]   {fact['type']}: {fact['value']}")
 
-    async with aiohttp.ClientSession(headers=auth_headers) as http:
-        resp = await http.post(
-            f"{MNEMONIC_URL}/users/{username}/facts",
-            json={"facts": facts, "session_id": session_id},
-        )
-        resp.raise_for_status()
-    logger.info(f"[{username}] Faits enregistrés dans mnemonic")
+    try:
+        async with aiohttp.ClientSession(headers=auth_headers) as http:
+            resp = await http.post(
+                f"{MNEMONIC_URL}/users/{username}/facts",
+                json={"facts": facts, "session_id": session_id},
+            )
+            resp.raise_for_status()
+        logger.info(f"[{username}] Faits enregistrés dans mnemonic")
+    except Exception as e:
+        logger.error(f"[{username}] Échec enregistrement des faits dans mnemonic: {e}")
 
 
 async def on_user_connected(topic: str, payload):

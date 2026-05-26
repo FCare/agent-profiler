@@ -104,13 +104,13 @@ async def _extract_facts(messages: list) -> list[dict]:
     return await loop.run_in_executor(None, _extract_facts_sync, messages)
 
 
-async def on_discussion(username: str, topic: str, payload):
+async def on_discussion(username: str, topic: str, payload, user_api_key: str):
     if not isinstance(payload, list) or not payload:
         return
 
     logger.info(f"[{username}] Discussion reçue ({len(payload)} messages)")
 
-    auth_headers = {"X-API-Key": SERVICE_API_KEY}
+    auth_headers = {"X-API-Key": user_api_key}
 
     try:
         async with aiohttp.ClientSession(headers=auth_headers) as http:
@@ -199,7 +199,7 @@ async def on_user_connected(topic: str, payload):
     )
 
     async def handler(t, p):
-        await on_discussion(username, t, p)
+        await on_discussion(username, t, p, password)
 
     nexus.subscribe(discussions_topic, handler)
     nexus.start_listening()

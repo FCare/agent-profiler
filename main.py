@@ -5,21 +5,8 @@ import os
 import sys
 
 import aiohttp
-import httpx
 import openai
 from nexus_client import NexusClient
-
-
-class _SessionCookieTransport(httpx.HTTPTransport):
-    """Remplace Authorization Bearer par Cookie vk_session pour Voight-Kampff."""
-    def __init__(self, session_cookie: str, **kwargs):
-        super().__init__(**kwargs)
-        self._session_cookie = session_cookie
-
-    def handle_request(self, request: httpx.Request) -> httpx.Response:
-        request.headers.pop("authorization", None)
-        request.headers["cookie"] = f"vk_session={self._session_cookie}"
-        return super().handle_request(request)
 
 logging.basicConfig(
     level=logging.INFO,
@@ -36,6 +23,7 @@ SERVICE_API_KEY = os.environ["MQTT_SERVICE_API_KEY"]
 MNEMONIC_URL = os.environ["MNEMONIC_URL"]
 LLM_BASE_URL = os.environ.get("LLM_BASE_URL", "https://thebrain.caronboulme.fr/v1")
 LLM_MODEL = os.environ.get("LLM_MODEL", "qwen3-vl-8b-instruct")
+LLAMACPP_API_KEY = os.environ["LLAMACPP_API_KEY"]
 
 AGENT_NAME = "profiler"
 
@@ -85,7 +73,7 @@ def _find_topic(private_topics: list, suffix: str) -> str | None:
     return None
 
 
-def _extract_facts_sync(messages: list, session_cookie: str) -> list[dict]:
+def _extract_facts_sync(messages: list) -> list[dict]:
     system_prompt = (
         "You analyze conversations to extract personal facts about the human user (not the assistant). "
         "Only return facts explicitly mentioned in the conversation. "
@@ -96,8 +84,7 @@ def _extract_facts_sync(messages: list, session_cookie: str) -> list[dict]:
     logger.info(f"Messages ({len(messages)}): {json.dumps(messages, ensure_ascii=False)}")
     logger.info(f"Tool: {EXTRACT_TOOL[0]['function']['name']}")
     try:
-        http_client = httpx.Client(transport=_SessionCookieTransport(session_cookie))
-        client = openai.OpenAI(api_key="no-key", base_url=LLM_BASE_URL, http_client=http_client)
+        client = openai.OpenAI(api_key=LLAMACPP_API_KEY, base_url=LLM_BASE_URL)
         resp = client.chat.completions.create(
             model=LLM_MODEL,
             messages=[{"role": "system", "content": system_prompt}, *messages],
@@ -112,9 +99,9 @@ def _extract_facts_sync(messages: list, session_cookie: str) -> list[dict]:
         return []
 
 
-async def _extract_facts(messages: list, session_cookie: str) -> list[dict]:
+async def _extract_facts(messages: list) -> list[dict]:
     loop = asyncio.get_event_loop()
-    return await loop.run_in_executor(None, _extract_facts_sync, messages, session_cookie)
+    return await loop.run_in_executor(None, _extract_facts_sync, messages)
 
 
 async def on_discussion(username: str, topic: str, payload, user_api_key: str):
@@ -141,7 +128,7 @@ async def on_discussion(username: str, topic: str, payload, user_api_key: str):
         return
 
     logger.info(f"[{username}] Extraction des faits en cours...")
-    facts = await _extract_facts(payload, user_api_key)
+    facts = await _extract_facts(payload)
     if not facts:
         logger.info(f"[{username}] Aucun fait extrait")
         return

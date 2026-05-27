@@ -78,7 +78,8 @@ def _extract_facts_sync(messages: list) -> list[dict]:
         "You extract personal facts about the human user from conversations. "
         "Rules: "
         "1. Only extract facts explicitly stated by the user, not the assistant. "
-        "2. Values must be complete English statements: \"likes retro gaming\", \"loves french fries\", \"lives in Lyon\". "
+        "2. Values must be complete English statements including preferences (positive and negative): "
+        "\"likes retro gaming\", \"dislikes Atari Lynx console\", \"loves french fries\", \"lives in Lyon\". "
         "3. NEVER use French or any non-English language in values. "
         "4. Call extract_user_facts with all found facts."
     )

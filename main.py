@@ -485,20 +485,41 @@ async def on_user_connected(topic: str, payload):
     profile_topic = f"users/{username}/profile"
     nexus = NexusClient.from_api_key(VK_URL, MQTT_HOST, SERVICE_USERNAME, SERVICE_API_KEY, MQTT_PORT)
 
+    search_topic = f"users/{username}/search_preference"
+    delete_topic = f"users/{username}/delete_facts"
+    search_results_topic = f"users/{username}/search_results"
+
     # Always republish topic declaration so agents that restarted can rediscover it
     await nexus.publish(
         agent_topics_topic,
         [{
             "agent": AGENT_NAME,
-            "topics": [{
-                "topic": profile_topic,
-                "description": "Profil utilisateur",
-                "access": "read",
-                "format": {
-                    "username": "string",
-                    "summary": "string",
+            "topics": [
+                {
+                    "topic": profile_topic,
+                    "description": "Profil utilisateur",
+                    "access": "read",
+                    "format": {"username": "string", "summary": "string"},
                 },
-            }],
+                {
+                    "topic": search_topic,
+                    "description": "Recherche sémantique de faits utilisateur",
+                    "access": "write",
+                    "format": {"query": "string", "n": 5},
+                },
+                {
+                    "topic": delete_topic,
+                    "description": "Suppression de faits (par id ou recherche sémantique)",
+                    "access": "write",
+                    "format": {"query": "string (OR) ids: [\"...\"]"},
+                },
+                {
+                    "topic": search_results_topic,
+                    "description": "Résultats de la dernière recherche de faits",
+                    "access": "read",
+                    "format": [{"id": "string", "type": "string", "value": "string"}],
+                },
+            ],
         }],
     )
     logger.info(f"[{username}] Topics déclarés sur {agent_topics_topic}")
@@ -510,12 +531,74 @@ async def on_user_connected(topic: str, payload):
     _subscribed_users.add(username)
     logger.info(f"Nouvel utilisateur: {username} — discussions={discussions_topic}")
 
+    auth_headers = {"Authorization": f"Bearer {password}"}
+
     async def handler(t, p):
         await on_discussion(username, t, p, password, nexus, profile_topic)
 
+    async def on_search_request(t, p):
+        if not isinstance(p, dict):
+            return
+        query = p.get("query", "")
+        n = int(p.get("n", 5))
+        if not query:
+            return
+        logger.info(f"[{username}] Recherche de faits: {query!r} (n={n})")
+        try:
+            async with aiohttp.ClientSession(headers=auth_headers) as http:
+                resp = await http.get(
+                    f"{MNEMONIC_URL}/users/{username}/facts/search",
+                    params={"q": query, "n": n},
+                )
+                resp.raise_for_status()
+                results = await resp.json()
+        except Exception as e:
+            logger.error(f"[{username}] Échec recherche: {e}")
+            return
+        await nexus.publish(search_results_topic, results)
+        logger.info(f"[{username}] {len(results)} résultats publiés sur {search_results_topic}")
+
+    async def on_delete_request(t, p):
+        if not isinstance(p, dict):
+            return
+        ids = p.get("ids")
+        query = p.get("query", "")
+        if not ids and not query:
+            return
+        async with aiohttp.ClientSession(headers=auth_headers) as http:
+            if ids:
+                logger.info(f"[{username}] Suppression par ids: {ids}")
+                for fact_id in ids:
+                    try:
+                        resp = await http.delete(f"{MNEMONIC_URL}/users/{username}/facts/{fact_id}")
+                        resp.raise_for_status()
+                    except Exception as e:
+                        logger.error(f"[{username}] Échec suppression {fact_id}: {e}")
+            else:
+                logger.info(f"[{username}] Suppression par recherche: {query!r}")
+                try:
+                    resp = await http.get(
+                        f"{MNEMONIC_URL}/users/{username}/facts/search",
+                        params={"q": query, "n": 50},
+                    )
+                    resp.raise_for_status()
+                    results = await resp.json()
+                except Exception as e:
+                    logger.error(f"[{username}] Échec recherche pour suppression: {e}")
+                    return
+                for fact in results:
+                    try:
+                        resp = await http.delete(f"{MNEMONIC_URL}/users/{username}/facts/{fact['id']}")
+                        resp.raise_for_status()
+                        logger.info(f"[{username}] Fait supprimé: {fact['id']} ({fact.get('type')}: {fact.get('value')})")
+                    except Exception as e:
+                        logger.error(f"[{username}] Échec suppression {fact['id']}: {e}")
+
     nexus.subscribe(discussions_topic, handler)
+    nexus.subscribe(search_topic, on_search_request)
+    nexus.subscribe(delete_topic, on_delete_request)
     nexus.start_listening()
-    logger.info(f"[{username}] Abonné aux discussions")
+    logger.info(f"[{username}] Abonné aux discussions, search_preference, delete_facts")
 
 
 async def main():

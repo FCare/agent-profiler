@@ -74,25 +74,25 @@ def _find_topic(private_topics: list, suffix: str) -> str | None:
 
 
 def _extract_facts_sync(messages: list) -> list[dict]:
+    system_prompt = (
+        "You analyze conversations to extract personal facts about the human user (not the assistant). "
+        "Only return facts explicitly mentioned in the conversation. "
+        "Always write fact values in English, regardless of the conversation language."
+    )
+    logger.info(f"LLM POST {LLM_BASE_URL}/chat/completions — model={LLM_MODEL}")
+    logger.info(f"System prompt: {system_prompt}")
+    logger.info(f"Messages ({len(messages)}): {json.dumps(messages, ensure_ascii=False)}")
+    logger.info(f"Tool: {EXTRACT_TOOL[0]['function']['name']}")
     try:
         client = openai.OpenAI(api_key=LLAMACPP_API_KEY, base_url=LLM_BASE_URL)
         resp = client.chat.completions.create(
             model=LLM_MODEL,
-            messages=[
-                {
-                    "role": "system",
-                    "content": (
-                        "You analyze conversations to extract personal facts about the human user (not the assistant). "
-                        "Only return facts explicitly mentioned in the conversation. "
-                        "Always write fact values in English, regardless of the conversation language."
-                    ),
-                },
-                *messages,
-            ],
+            messages=[{"role": "system", "content": system_prompt}, *messages],
             tools=EXTRACT_TOOL,
             tool_choice={"type": "function", "function": {"name": "extract_user_facts"}},
         )
         args = resp.choices[0].message.tool_calls[0].function.arguments
+        logger.info(f"LLM response: {args}")
         return json.loads(args).get("facts", [])
     except Exception as e:
         logger.error(f"Extraction de faits échouée: {e}")

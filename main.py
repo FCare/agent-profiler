@@ -53,10 +53,7 @@ def _make_extract_tool(known_types: list[str]) -> list:
         "type": "function",
         "function": {
             "name": "extract_user_facts",
-            "description": (
-                "Extraire les faits personnels sur l'utilisateur humain depuis la conversation. "
-                "Ne retourner que des faits explicitement mentionnés par l'utilisateur, pas l'assistant."
-            ),
+            "description": "Extract all personal facts and interests from the [user] lines in the conversation transcript.",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -115,25 +112,31 @@ def _find_topic(private_topics: list, suffix: str) -> str | None:
 
 
 EXTRACT_SYSTEM_PROMPT = (
-    "You extract personal facts and interests about the human user from a single message. "
-    "Every question or request reveals an interest: asking for weather in Paris → \"is interested in weather in Paris\". "
+    "You extract personal facts and interests about the human user from a conversation transcript. "
+    "The transcript contains [user] and [assistant] lines. "
+    "Extract facts ONLY from [user] lines. Use [assistant] lines as context to better understand and categorize user messages. "
+    "Every [user] line reveals at least one fact: questions reveal interests, requests reveal needs, statements reveal preferences. "
     "Values must be complete English statements, never French. "
-    "Examples: "
-    "- \"j aime le retro gaming\" → {\"type\": \"video_game\", \"value\": \"likes retro gaming\"} "
-    "- \"parle moi de l architecture de la sega saturn\" → {\"type\": \"technology\", \"value\": \"is interested in Sega Saturn architecture\"} "
-    "- \"donne moi la meteo de Paris\" → {\"type\": \"location\", \"value\": \"is interested in weather in Paris\"} "
-    "Call extract_user_facts with all facts found in the message."
+    "Examples:\n"
+    "- [user]: quelle meteo demain a paris → {type: \"location\", value: \"is interested in weather in Paris\"}\n"
+    "- [user]: j aime le retro gaming → {type: \"video_game\", value: \"likes retro gaming\"}\n"
+    "- [user]: tu connais le cycle de Hain? / [assistant]: c'est une série SF / [user]: c'est plusieurs livres → {type: \"book\", value: \"is interested in the Hain cycle\"}\n"
+    "Call extract_user_facts with ALL facts found."
 )
 
 
-def _extract_facts_for_message_sync(user_message: str, known_types: list[str]) -> list[dict]:
+def _extract_facts_sync(messages: list, known_types: list[str]) -> list[dict]:
+    transcript = "\n".join(
+        f"[{m['role']}]: {m['content']}"
+        for m in messages if m.get("role") in ("user", "assistant")
+    )
     try:
         client = openai.OpenAI(api_key=LLAMACPP_API_KEY, base_url=LLM_BASE_URL)
         resp = client.chat.completions.create(
             model=LLM_MODEL,
             messages=[
                 {"role": "system", "content": EXTRACT_SYSTEM_PROMPT},
-                {"role": "user", "content": user_message},
+                {"role": "user", "content": f"Conversation:\n{transcript}"},
             ],
             tools=_make_extract_tool(known_types),
             tool_choice="required",
@@ -143,7 +146,7 @@ def _extract_facts_for_message_sync(user_message: str, known_types: list[str]) -
             return []
         return json.loads(tool_calls[0].function.arguments).get("facts", [])
     except Exception as e:
-        logger.error(f"Extraction de faits échouée pour message: {e}")
+        logger.error(f"Extraction de faits échouée: {e}")
         return []
 
 
@@ -160,17 +163,13 @@ async def _fetch_known_types(username: str, auth_headers: dict) -> list[str]:
 
 
 async def _extract_facts(messages: list, known_types: list[str]) -> list[dict]:
-    user_messages = [m["content"] for m in messages if m.get("role") == "user"]
-    logger.info(f"LLM POST {LLM_BASE_URL}/chat/completions — model={LLM_MODEL}, {len(user_messages)} messages utilisateur, types connus: {known_types}")
+    user_count = sum(1 for m in messages if m.get("role") == "user")
+    logger.info(f"LLM POST {LLM_BASE_URL}/chat/completions — model={LLM_MODEL}, {user_count} messages utilisateur sur {len(messages)}, types connus: {known_types}")
     logger.info(f"System prompt: {EXTRACT_SYSTEM_PROMPT}")
-    all_facts = []
     loop = asyncio.get_event_loop()
-    for msg in user_messages:
-        logger.info(f"Analyse message: {msg}")
-        facts = await loop.run_in_executor(None, _extract_facts_for_message_sync, msg, known_types)
-        logger.info(f"Faits extraits: {json.dumps(facts, ensure_ascii=False)}")
-        all_facts.extend(facts)
-    return all_facts
+    facts = await loop.run_in_executor(None, _extract_facts_sync, messages, known_types)
+    logger.info(f"Faits extraits: {json.dumps(facts, ensure_ascii=False)}")
+    return facts
 
 
 def _find_habits_sync(facts: list[dict], known_types: list[str]) -> list[dict]:

@@ -9,6 +9,18 @@ import httpx
 import openai
 from nexus_client import NexusClient
 
+
+class _SessionCookieTransport(httpx.HTTPTransport):
+    """Remplace Authorization Bearer par Cookie vk_session pour Voight-Kampff."""
+    def __init__(self, session_cookie: str, **kwargs):
+        super().__init__(**kwargs)
+        self._session_cookie = session_cookie
+
+    def handle_request(self, request: httpx.Request) -> httpx.Response:
+        request.headers.pop("authorization", None)
+        request.headers["cookie"] = f"vk_session={self._session_cookie}"
+        return super().handle_request(request)
+
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
@@ -84,7 +96,7 @@ def _extract_facts_sync(messages: list, session_cookie: str) -> list[dict]:
     logger.info(f"Messages ({len(messages)}): {json.dumps(messages, ensure_ascii=False)}")
     logger.info(f"Tool: {EXTRACT_TOOL[0]['function']['name']}")
     try:
-        http_client = httpx.Client(headers={"Cookie": f"vk_session={session_cookie}"})
+        http_client = httpx.Client(transport=_SessionCookieTransport(session_cookie))
         client = openai.OpenAI(api_key="no-key", base_url=LLM_BASE_URL, http_client=http_client)
         resp = client.chat.completions.create(
             model=LLM_MODEL,

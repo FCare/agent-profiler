@@ -34,7 +34,7 @@ DEFAULT_FACT_TYPES = [
     "name", "location", "occupation", "family", "language", "skill",
     "cuisine", "music", "sport", "video_game", "technology", "politics",
     "cinema", "book", "travel", "art", "fashion", "nature", "science",
-    "philosophy", "humor", "habit", "goal", "personality", "value",
+    "philosophy", "humor", "habit", "goal", "personality",
 ]
 
 
@@ -121,6 +121,7 @@ EXTRACT_SYSTEM_PROMPT = (
     "- [user]: quelle meteo demain a paris → {type: \"location\", value: \"is interested in weather in Paris\"}\n"
     "- [user]: j aime le retro gaming → {type: \"video_game\", value: \"likes retro gaming\"}\n"
     "- [user]: tu connais le cycle de Hain? / [assistant]: c'est une série SF / [user]: c'est plusieurs livres → {type: \"book\", value: \"is interested in the Hain cycle\"}\n"
+    "- [user]: j'aime le space opera → {type: \"book\", value: \"enjoys space opera as a genre\"}\n"
     "Call extract_user_facts with ALL facts found."
 )
 

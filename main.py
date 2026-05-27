@@ -505,6 +505,7 @@ async def on_user_connected(topic: str, payload):
                     "topic": search_topic,
                     "description": "Recherche sémantique de faits utilisateur",
                     "access": "write",
+                    "response_topic": search_results_topic,
                     "format": {"query": "string", "n": 5},
                 },
                 {

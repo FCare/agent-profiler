@@ -80,8 +80,9 @@ def _extract_facts_sync(messages: list) -> list[dict]:
         "1. Only extract facts explicitly stated by the user, not the assistant. "
         "2. Values must be complete English statements including preferences (positive and negative): "
         "\"likes retro gaming\", \"dislikes Atari Lynx console\", \"loves french fries\", \"lives in Lyon\". "
-        "3. NEVER use French or any non-English language in values. "
-        "4. Call extract_user_facts with all found facts."
+        "3. Be specific: extract both general interests AND specific mentions (e.g. \"passionate about architecture\" AND \"interested in Chateau de Versailles\"). "
+        "4. NEVER use French or any non-English language in values. "
+        "5. Call extract_user_facts with all found facts."
     )
     logger.info(f"LLM POST {LLM_BASE_URL}/chat/completions — model={LLM_MODEL}")
     logger.info(f"System prompt: {system_prompt}")

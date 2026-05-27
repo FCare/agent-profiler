@@ -5,6 +5,7 @@ import os
 import sys
 
 import aiohttp
+import httpx
 import openai
 from nexus_client import NexusClient
 
@@ -21,9 +22,8 @@ MQTT_PORT = int(os.environ.get("MQTT_PORT", "1883"))
 SERVICE_USERNAME = os.environ["MQTT_SERVICE_USERNAME"]
 SERVICE_API_KEY = os.environ["MQTT_SERVICE_API_KEY"]
 MNEMONIC_URL = os.environ["MNEMONIC_URL"]
-LLM_BASE_URL = os.environ["LLM_BASE_URL"]
+LLM_BASE_URL = os.environ.get("LLM_BASE_URL", "https://thebrain.caronboulme.fr/v1")
 LLM_MODEL = os.environ.get("LLM_MODEL", "qwen3-vl-8b-instruct")
-LLAMACPP_API_KEY = os.environ.get("LLAMACPP_API_KEY", "no-key")
 
 AGENT_NAME = "profiler"
 
@@ -73,7 +73,7 @@ def _find_topic(private_topics: list, suffix: str) -> str | None:
     return None
 
 
-def _extract_facts_sync(messages: list) -> list[dict]:
+def _extract_facts_sync(messages: list, session_cookie: str) -> list[dict]:
     system_prompt = (
         "You analyze conversations to extract personal facts about the human user (not the assistant). "
         "Only return facts explicitly mentioned in the conversation. "
@@ -84,7 +84,8 @@ def _extract_facts_sync(messages: list) -> list[dict]:
     logger.info(f"Messages ({len(messages)}): {json.dumps(messages, ensure_ascii=False)}")
     logger.info(f"Tool: {EXTRACT_TOOL[0]['function']['name']}")
     try:
-        client = openai.OpenAI(api_key=LLAMACPP_API_KEY, base_url=LLM_BASE_URL)
+        http_client = httpx.Client(headers={"Cookie": f"vk_session={session_cookie}"})
+        client = openai.OpenAI(api_key="no-key", base_url=LLM_BASE_URL, http_client=http_client)
         resp = client.chat.completions.create(
             model=LLM_MODEL,
             messages=[{"role": "system", "content": system_prompt}, *messages],
@@ -99,9 +100,9 @@ def _extract_facts_sync(messages: list) -> list[dict]:
         return []
 
 
-async def _extract_facts(messages: list) -> list[dict]:
+async def _extract_facts(messages: list, session_cookie: str) -> list[dict]:
     loop = asyncio.get_event_loop()
-    return await loop.run_in_executor(None, _extract_facts_sync, messages)
+    return await loop.run_in_executor(None, _extract_facts_sync, messages, session_cookie)
 
 
 async def on_discussion(username: str, topic: str, payload, user_api_key: str):
@@ -128,7 +129,7 @@ async def on_discussion(username: str, topic: str, payload, user_api_key: str):
         return
 
     logger.info(f"[{username}] Extraction des faits en cours...")
-    facts = await _extract_facts(payload)
+    facts = await _extract_facts(payload, user_api_key)
     if not facts:
         logger.info(f"[{username}] Aucun fait extrait")
         return

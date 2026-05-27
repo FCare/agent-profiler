@@ -24,6 +24,7 @@ MNEMONIC_URL = os.environ["MNEMONIC_URL"]
 LLM_BASE_URL = os.environ.get("LLM_BASE_URL", "https://thebrain.caronboulme.fr/v1")
 LLM_MODEL = os.environ.get("LLM_MODEL", "qwen3-vl-8b-instruct")
 LLAMACPP_API_KEY = os.environ["LLAMACPP_API_KEY"]
+HABIT_THRESHOLD = int(os.environ.get("HABIT_THRESHOLD", "5"))
 
 AGENT_NAME = "profiler"
 
@@ -120,6 +121,125 @@ async def _extract_facts(messages: list) -> list[dict]:
     return all_facts
 
 
+CONSOLIDATE_TOOL = [{
+    "type": "function",
+    "function": {
+        "name": "declare_habits",
+        "description": "Declare groups of similar facts that form a habit.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "habits": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "description": {"type": "string"},
+                            "type": {"type": "string", "enum": FACT_TYPES},
+                            "fact_ids": {"type": "array", "items": {"type": "string"}},
+                        },
+                        "required": ["description", "type", "fact_ids"],
+                    },
+                }
+            },
+            "required": ["habits"],
+        },
+    },
+}]
+
+
+def _find_habits_sync(facts: list[dict]) -> list[dict]:
+    if len(facts) < HABIT_THRESHOLD:
+        return []
+    facts_text = "\n".join(f"- id={f['id']} type={f['type']} value=\"{f['value']}\"" for f in facts)
+    logger.info(f"Consolidation — LLM POST {LLM_BASE_URL}/chat/completions avec {len(facts)} faits")
+    logger.info(f"Consolidation — faits envoyés:\n{facts_text}")
+    try:
+        client = openai.OpenAI(api_key=LLAMACPP_API_KEY, base_url=LLM_BASE_URL)
+        resp = client.chat.completions.create(
+            model=LLM_MODEL,
+            messages=[
+                {"role": "system", "content": (
+                    "You analyze a list of user facts and identify groups of similar facts that reveal a recurring habit. "
+                    f"Only group facts that are clearly related AND have at least {HABIT_THRESHOLD} facts in the group (e.g. {HABIT_THRESHOLD}+ weather requests = habit of checking weather). "
+                    "For each group, write a short English habit description (e.g. 'regularly checks weather forecasts', 'passionate about retro gaming'). "
+                    "Call declare_habits with the groups found. If no groups exist, call declare_habits with an empty list."
+                )},
+                {"role": "user", "content": f"Facts:\n{facts_text}"},
+            ],
+            tools=CONSOLIDATE_TOOL,
+            tool_choice="required",
+        )
+        tool_calls = resp.choices[0].message.tool_calls
+        if not tool_calls:
+            logger.warning("Consolidation — LLM n'a pas retourné de tool call")
+            return []
+        result = json.loads(tool_calls[0].function.arguments).get("habits", [])
+        logger.info(f"Consolidation — LLM response: {json.dumps(result, ensure_ascii=False)}")
+        return result
+    except Exception as e:
+        logger.error(f"Identification des habitudes échouée: {e}")
+        return []
+
+
+async def _consolidate_habits(username: str, auth_headers: dict):
+    logger.info(f"[{username}] Consolidation des habitudes en cours...")
+    try:
+        async with aiohttp.ClientSession(headers=auth_headers) as http:
+            resp = await http.get(f"{MNEMONIC_URL}/users/{username}/facts")
+            resp.raise_for_status()
+            all_facts = await resp.json()
+    except Exception as e:
+        logger.error(f"[{username}] Échec récupération faits pour consolidation: {e}")
+        return
+
+    logger.info(f"[{username}] {len(all_facts)} faits récupérés (seuil: {HABIT_THRESHOLD})")
+    if len(all_facts) < HABIT_THRESHOLD:
+        logger.info(f"[{username}] Pas assez de faits pour consolidation")
+        return
+
+    loop = asyncio.get_event_loop()
+    habit_groups = await loop.run_in_executor(None, _find_habits_sync, all_facts)
+
+    if not habit_groups:
+        logger.info(f"[{username}] Aucune habitude détectée")
+        return
+
+    logger.info(f"[{username}] {len(habit_groups)} habitude(s) détectée(s)")
+    facts_by_id = {f["id"]: f for f in all_facts}
+
+    for habit in habit_groups:
+        valid_ids = [fid for fid in habit["fact_ids"] if fid in facts_by_id]
+        logger.info(f"[{username}] Habitude '{habit['description']}': {len(valid_ids)} faits valides sur {len(habit['fact_ids'])} proposés")
+        if len(valid_ids) < HABIT_THRESHOLD:
+            logger.info(f"[{username}] Ignoré — moins de {HABIT_THRESHOLD} faits valides")
+            continue
+
+        session_ids = list(dict.fromkeys(facts_by_id[fid]["session_id"] for fid in valid_ids))
+        logger.info(f"[{username}] Stockage habitude: type={habit['type']} description=\"{habit['description']}\" sessions={session_ids}")
+
+        try:
+            async with aiohttp.ClientSession(headers=auth_headers) as http:
+                resp = await http.post(
+                    f"{MNEMONIC_URL}/users/{username}/facts",
+                    json={
+                        "facts": [{"type": habit["type"], "value": habit["description"]}],
+                        "session_id": session_ids[0],
+                        "session_ids": session_ids,
+                    },
+                )
+                resp.raise_for_status()
+                logger.info(f"[{username}] Habitude stockée dans mnemonic")
+
+                for fid in valid_ids:
+                    del_resp = await http.delete(f"{MNEMONIC_URL}/users/{username}/facts/{fid}")
+                    logger.info(f"[{username}] Fait {fid} supprimé (status {del_resp.status})")
+
+            logger.info(f"[{username}] Consolidation terminée: {len(valid_ids)} faits → 1 habitude")
+        except Exception as e:
+            logger.error(f"[{username}] Échec consolidation habitude: {e}")
+
+
 async def on_discussion(username: str, topic: str, payload, user_api_key: str):
     if not isinstance(payload, list) or not payload:
         return
@@ -163,6 +283,9 @@ async def on_discussion(username: str, topic: str, payload, user_api_key: str):
         logger.info(f"[{username}] Faits enregistrés dans mnemonic")
     except Exception as e:
         logger.error(f"[{username}] Échec enregistrement des faits dans mnemonic: {e}")
+        return
+
+    await _consolidate_habits(username, auth_headers)
 
 
 async def on_user_connected(topic: str, payload):

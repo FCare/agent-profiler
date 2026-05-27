@@ -260,6 +260,7 @@ async def _consolidate_habits(username: str, auth_headers: dict):
                         "facts": [{"type": habit["type"], "value": habit["description"]}],
                         "session_id": session_ids[0],
                         "session_ids": session_ids,
+                        "is_habit": True,
                     },
                 )
                 resp.raise_for_status()
@@ -274,7 +275,142 @@ async def _consolidate_habits(username: str, auth_headers: dict):
             logger.error(f"[{username}] Échec consolidation habitude: {e}")
 
 
-async def on_discussion(username: str, topic: str, payload, user_api_key: str):
+SELECT_TYPES_TOOL = [{
+    "type": "function",
+    "function": {
+        "name": "select_profile_types",
+        "description": "Select fact types that describe core personal attributes of the user.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "types": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "Types that describe who the person IS (name, location, occupation, family, language, personality, goal, skill). Exclude pure hobby/interest types (book, music, video_game, cinema) as those are covered by habits.",
+                }
+            },
+            "required": ["types"],
+        },
+    },
+}]
+
+
+def _select_profile_types_sync(available_types: list[str]) -> list[str]:
+    if not available_types:
+        return []
+    logger.info(f"Sélection des types de profil parmi: {available_types}")
+    try:
+        client = openai.OpenAI(api_key=LLAMACPP_API_KEY, base_url=LLM_BASE_URL)
+        resp = client.chat.completions.create(
+            model=LLM_MODEL,
+            messages=[
+                {"role": "system", "content": (
+                    "Select the fact types from the provided list that describe core personal attributes (name, location, occupation, family, language, personality, goal, skill). "
+                    "Exclude pure hobby/interest types (book, music, video_game, cinema, sport, food) — those are covered by habits. "
+                    "Call select_profile_types with the relevant types."
+                )},
+                {"role": "user", "content": f"Available types: {', '.join(available_types)}"},
+            ],
+            tools=SELECT_TYPES_TOOL,
+            tool_choice="required",
+        )
+        tool_calls = resp.choices[0].message.tool_calls
+        if not tool_calls:
+            return []
+        result = json.loads(tool_calls[0].function.arguments).get("types", [])
+        logger.info(f"Types de profil sélectionnés: {result}")
+        return result
+    except Exception as e:
+        logger.error(f"Sélection des types de profil échouée: {e}")
+        return []
+
+
+def _build_profile_sync(username: str, personal_facts: list[dict], habits: list[dict]) -> str:
+    lines = []
+    if personal_facts:
+        lines.append("Personal facts:")
+        for f in personal_facts:
+            lines.append(f"  [{f['type']}] {f['value']}")
+    if habits:
+        lines.append("Habits and recurring interests:")
+        for h in habits:
+            lines.append(f"  [{h['type']}] {h['value']}")
+    context = "\n".join(lines)
+    logger.info(f"[{username}] Contexte profil envoyé au LLM:\n{context}")
+    try:
+        client = openai.OpenAI(api_key=LLAMACPP_API_KEY, base_url=LLM_BASE_URL)
+        resp = client.chat.completions.create(
+            model=LLM_MODEL,
+            messages=[
+                {"role": "system", "content": (
+                    "Generate a concise personal profile of the user from the provided facts and habits. "
+                    "Write in third person, in English. "
+                    "Start with personal info (name, location, occupation, family if known), then describe recurring habits and interests. "
+                    "Be factual, concise, and natural-sounding. 3-6 sentences."
+                )},
+                {"role": "user", "content": f"User: {username}\n\n{context}"},
+            ],
+        )
+        return resp.choices[0].message.content.strip()
+    except Exception as e:
+        logger.error(f"[{username}] Génération du texte de profil échouée: {e}")
+        return ""
+
+
+async def _generate_profile(username: str, auth_headers: dict, nexus, profile_topic: str):
+    logger.info(f"[{username}] Génération du profil...")
+    try:
+        async with aiohttp.ClientSession(headers=auth_headers) as http:
+            resp = await http.get(f"{MNEMONIC_URL}/users/{username}/facts/types")
+            resp.raise_for_status()
+            available_types = (await resp.json()).get("types", [])
+    except Exception as e:
+        logger.error(f"[{username}] Échec récupération types pour profil: {e}")
+        return
+
+    logger.info(f"[{username}] Types disponibles: {available_types}")
+    if not available_types:
+        logger.info(f"[{username}] Aucun type disponible, profil ignoré")
+        return
+
+    loop = asyncio.get_event_loop()
+    profile_types = await loop.run_in_executor(None, _select_profile_types_sync, available_types)
+    logger.info(f"[{username}] Types retenus pour faits personnels: {profile_types}")
+
+    personal_facts = []
+    habits = []
+    try:
+        async with aiohttp.ClientSession(headers=auth_headers) as http:
+            for fact_type in profile_types:
+                resp = await http.get(f"{MNEMONIC_URL}/users/{username}/facts", params={"fact_type": fact_type})
+                resp.raise_for_status()
+                personal_facts.extend(await resp.json())
+            resp = await http.get(f"{MNEMONIC_URL}/users/{username}/habits")
+            resp.raise_for_status()
+            habits = await resp.json()
+    except Exception as e:
+        logger.error(f"[{username}] Échec récupération faits/habitudes pour profil: {e}")
+        return
+
+    logger.info(f"[{username}] {len(personal_facts)} faits personnels, {len(habits)} habitudes")
+    if not personal_facts and not habits:
+        logger.info(f"[{username}] Rien à profiler")
+        return
+
+    profile_text = await loop.run_in_executor(None, _build_profile_sync, username, personal_facts, habits)
+    if not profile_text:
+        return
+
+    logger.info(f"[{username}] Profil généré:\n{profile_text}")
+    await nexus.publish(
+        profile_topic,
+        {"username": username, "summary": profile_text},
+        retain=True,
+    )
+    logger.info(f"[{username}] Profil publié sur {profile_topic}")
+
+
+async def on_discussion(username: str, topic: str, payload, user_api_key: str, nexus, profile_topic: str):
     if not isinstance(payload, list) or not payload:
         return
 
@@ -323,6 +459,7 @@ async def on_discussion(username: str, topic: str, payload, user_api_key: str):
         return
 
     await _consolidate_habits(username, auth_headers)
+    await _generate_profile(username, auth_headers, nexus, profile_topic)
 
 
 async def on_user_connected(topic: str, payload):
@@ -363,8 +500,7 @@ async def on_user_connected(topic: str, payload):
                 "access": "read",
                 "format": {
                     "username": "string",
-                    "preferences": {},
-                    "history_summary": "string",
+                    "summary": "string",
                 },
             }],
         }],
@@ -372,12 +508,12 @@ async def on_user_connected(topic: str, payload):
 
     await nexus.publish(
         profile_topic,
-        {"username": username, "preferences": {}, "history_summary": ""},
+        {"username": username, "summary": ""},
         retain=True,
     )
 
     async def handler(t, p):
-        await on_discussion(username, t, p, password)
+        await on_discussion(username, t, p, password, nexus, profile_topic)
 
     nexus.subscribe(discussions_topic, handler)
     nexus.start_listening()

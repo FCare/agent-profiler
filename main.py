@@ -75,10 +75,12 @@ def _find_topic(private_topics: list, suffix: str) -> str | None:
 
 def _extract_facts_sync(messages: list) -> list[dict]:
     system_prompt = (
-        "You analyze conversations to extract personal facts about the human user (not the assistant). "
-        "Only return facts explicitly mentioned in the conversation. "
-        "Always write fact values in English, regardless of the conversation language. "
-        "Always call the extract_user_facts tool with the facts you find, even if there is only one."
+        "You extract personal facts about the human user from conversations. "
+        "Rules: "
+        "1. Only extract facts explicitly stated by the user, not the assistant. "
+        "2. Values must be complete English statements: \"likes retro gaming\", \"loves french fries\", \"lives in Lyon\". "
+        "3. NEVER use French or any non-English language in values. "
+        "4. Call extract_user_facts with all found facts."
     )
     logger.info(f"LLM POST {LLM_BASE_URL}/chat/completions — model={LLM_MODEL}")
     logger.info(f"System prompt: {system_prompt}")

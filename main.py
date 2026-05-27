@@ -73,46 +73,51 @@ def _find_topic(private_topics: list, suffix: str) -> str | None:
     return None
 
 
-def _extract_facts_sync(messages: list) -> list[dict]:
-    system_prompt = (
-        "You extract personal facts and interests about the human user from conversations. "
-        "Rules: "
-        "1. Extract facts from both explicit statements AND questions/requests. "
-        "2. Values must be complete English statements. Examples: "
-        "- User says \"j aime le retro gaming\" → {\"type\": \"video_game\", \"value\": \"likes retro gaming\"} "
-        "- User asks \"parle moi de l architecture de la sega saturn\" → {\"type\": \"technology\", \"value\": \"is interested in Sega Saturn architecture\"} "
-        "- User asks \"donne moi la meteo de Paris\" → {\"type\": \"location\", \"value\": \"is interested in weather in Paris\"} "
-        "3. NEVER use French or any non-English language in values. "
-        "4. Call extract_user_facts with all found facts."
-    )
-    logger.info(f"LLM POST {LLM_BASE_URL}/chat/completions — model={LLM_MODEL}")
-    logger.info(f"System prompt: {system_prompt}")
-    logger.info(f"Messages ({len(messages)}): {json.dumps(messages, ensure_ascii=False)}")
-    logger.info(f"Tool: {EXTRACT_TOOL[0]['function']['name']}")
+EXTRACT_SYSTEM_PROMPT = (
+    "You extract personal facts and interests about the human user from a single message. "
+    "Every question or request reveals an interest: asking for weather in Paris → \"is interested in weather in Paris\". "
+    "Values must be complete English statements, never French. "
+    "Examples: "
+    "- \"j aime le retro gaming\" → {\"type\": \"video_game\", \"value\": \"likes retro gaming\"} "
+    "- \"parle moi de l architecture de la sega saturn\" → {\"type\": \"technology\", \"value\": \"is interested in Sega Saturn architecture\"} "
+    "- \"donne moi la meteo de Paris\" → {\"type\": \"location\", \"value\": \"is interested in weather in Paris\"} "
+    "Call extract_user_facts with all facts found in the message."
+)
+
+
+def _extract_facts_for_message_sync(user_message: str) -> list[dict]:
     try:
         client = openai.OpenAI(api_key=LLAMACPP_API_KEY, base_url=LLM_BASE_URL)
         resp = client.chat.completions.create(
             model=LLM_MODEL,
-            messages=[{"role": "system", "content": system_prompt}, *messages],
+            messages=[
+                {"role": "system", "content": EXTRACT_SYSTEM_PROMPT},
+                {"role": "user", "content": user_message},
+            ],
             tools=EXTRACT_TOOL,
             tool_choice="required",
         )
-        logger.info(f"LLM response: {resp.choices[0].message}")
         tool_calls = resp.choices[0].message.tool_calls
         if not tool_calls:
-            logger.warning("LLM n'a pas retourné de tool call")
             return []
-        args = tool_calls[0].function.arguments
-        logger.info(f"LLM tool arguments: {args}")
-        return json.loads(args).get("facts", [])
+        return json.loads(tool_calls[0].function.arguments).get("facts", [])
     except Exception as e:
-        logger.error(f"Extraction de faits échouée: {e}")
+        logger.error(f"Extraction de faits échouée pour message: {e}")
         return []
 
 
 async def _extract_facts(messages: list) -> list[dict]:
+    user_messages = [m["content"] for m in messages if m.get("role") == "user"]
+    logger.info(f"LLM POST {LLM_BASE_URL}/chat/completions — model={LLM_MODEL}, {len(user_messages)} messages utilisateur")
+    logger.info(f"System prompt: {EXTRACT_SYSTEM_PROMPT}")
+    all_facts = []
     loop = asyncio.get_event_loop()
-    return await loop.run_in_executor(None, _extract_facts_sync, messages)
+    for msg in user_messages:
+        logger.info(f"Analyse message: {msg}")
+        facts = await loop.run_in_executor(None, _extract_facts_for_message_sync, msg)
+        logger.info(f"Faits extraits: {json.dumps(facts, ensure_ascii=False)}")
+        all_facts.extend(facts)
+    return all_facts
 
 
 async def on_discussion(username: str, topic: str, payload, user_api_key: str):

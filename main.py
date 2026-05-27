@@ -30,40 +30,80 @@ AGENT_NAME = "profiler"
 
 _subscribed_users: set[str] = set()
 
-FACT_TYPES = [
+DEFAULT_FACT_TYPES = [
     "name", "location", "occupation", "family", "language", "skill",
     "cuisine", "music", "sport", "video_game", "technology", "politics",
     "cinema", "book", "travel", "art", "fashion", "nature", "science",
     "philosophy", "humor", "habit", "goal", "personality", "value",
 ]
 
-EXTRACT_TOOL = [{
-    "type": "function",
-    "function": {
-        "name": "extract_user_facts",
+
+def _type_field_schema(known_types: list[str]) -> dict:
+    return {
+        "type": "string",
         "description": (
-            "Extraire les faits personnels sur l'utilisateur humain depuis la conversation. "
-            "Ne retourner que des faits explicitement mentionnés par l'utilisateur, pas l'assistant."
+            f"Fact category. Prefer one of the known types if it fits: {', '.join(known_types)}. "
+            "Otherwise invent a concise English noun (e.g. 'sport', 'cinema')."
         ),
-        "parameters": {
-            "type": "object",
-            "properties": {
-                "facts": {
-                    "type": "array",
-                    "items": {
-                        "type": "object",
-                        "properties": {
-                            "type": {"type": "string", "enum": FACT_TYPES},
-                            "value": {"type": "string"},
+    }
+
+
+def _make_extract_tool(known_types: list[str]) -> list:
+    return [{
+        "type": "function",
+        "function": {
+            "name": "extract_user_facts",
+            "description": (
+                "Extraire les faits personnels sur l'utilisateur humain depuis la conversation. "
+                "Ne retourner que des faits explicitement mentionnés par l'utilisateur, pas l'assistant."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "facts": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "type": _type_field_schema(known_types),
+                                "value": {"type": "string"},
+                            },
+                            "required": ["type", "value"],
                         },
-                        "required": ["type", "value"],
-                    },
-                }
+                    }
+                },
+                "required": ["facts"],
             },
-            "required": ["facts"],
         },
-    },
-}]
+    }]
+
+
+def _make_consolidate_tool(known_types: list[str]) -> list:
+    return [{
+        "type": "function",
+        "function": {
+            "name": "declare_habits",
+            "description": "Declare groups of similar facts that form a habit.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "habits": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "description": {"type": "string"},
+                                "type": _type_field_schema(known_types),
+                                "fact_ids": {"type": "array", "items": {"type": "string"}},
+                            },
+                            "required": ["description", "type", "fact_ids"],
+                        },
+                    }
+                },
+                "required": ["habits"],
+            },
+        },
+    }]
 
 
 def _find_topic(private_topics: list, suffix: str) -> str | None:
@@ -86,7 +126,7 @@ EXTRACT_SYSTEM_PROMPT = (
 )
 
 
-def _extract_facts_for_message_sync(user_message: str) -> list[dict]:
+def _extract_facts_for_message_sync(user_message: str, known_types: list[str]) -> list[dict]:
     try:
         client = openai.OpenAI(api_key=LLAMACPP_API_KEY, base_url=LLM_BASE_URL)
         resp = client.chat.completions.create(
@@ -95,7 +135,7 @@ def _extract_facts_for_message_sync(user_message: str) -> list[dict]:
                 {"role": "system", "content": EXTRACT_SYSTEM_PROMPT},
                 {"role": "user", "content": user_message},
             ],
-            tools=EXTRACT_TOOL,
+            tools=_make_extract_tool(known_types),
             tool_choice="required",
         )
         tool_calls = resp.choices[0].message.tool_calls
@@ -107,48 +147,33 @@ def _extract_facts_for_message_sync(user_message: str) -> list[dict]:
         return []
 
 
-async def _extract_facts(messages: list) -> list[dict]:
+async def _fetch_known_types(username: str, auth_headers: dict) -> list[str]:
+    try:
+        async with aiohttp.ClientSession(headers=auth_headers) as http:
+            resp = await http.get(f"{MNEMONIC_URL}/users/{username}/facts/types")
+            resp.raise_for_status()
+            types = (await resp.json()).get("types", [])
+            return types if types else DEFAULT_FACT_TYPES
+    except Exception as e:
+        logger.warning(f"[{username}] Impossible de récupérer les types, utilisation des défauts: {e}")
+        return DEFAULT_FACT_TYPES
+
+
+async def _extract_facts(messages: list, known_types: list[str]) -> list[dict]:
     user_messages = [m["content"] for m in messages if m.get("role") == "user"]
-    logger.info(f"LLM POST {LLM_BASE_URL}/chat/completions — model={LLM_MODEL}, {len(user_messages)} messages utilisateur")
+    logger.info(f"LLM POST {LLM_BASE_URL}/chat/completions — model={LLM_MODEL}, {len(user_messages)} messages utilisateur, types connus: {known_types}")
     logger.info(f"System prompt: {EXTRACT_SYSTEM_PROMPT}")
     all_facts = []
     loop = asyncio.get_event_loop()
     for msg in user_messages:
         logger.info(f"Analyse message: {msg}")
-        facts = await loop.run_in_executor(None, _extract_facts_for_message_sync, msg)
+        facts = await loop.run_in_executor(None, _extract_facts_for_message_sync, msg, known_types)
         logger.info(f"Faits extraits: {json.dumps(facts, ensure_ascii=False)}")
         all_facts.extend(facts)
     return all_facts
 
 
-CONSOLIDATE_TOOL = [{
-    "type": "function",
-    "function": {
-        "name": "declare_habits",
-        "description": "Declare groups of similar facts that form a habit.",
-        "parameters": {
-            "type": "object",
-            "properties": {
-                "habits": {
-                    "type": "array",
-                    "items": {
-                        "type": "object",
-                        "properties": {
-                            "description": {"type": "string"},
-                            "type": {"type": "string", "enum": FACT_TYPES},
-                            "fact_ids": {"type": "array", "items": {"type": "string"}},
-                        },
-                        "required": ["description", "type", "fact_ids"],
-                    },
-                }
-            },
-            "required": ["habits"],
-        },
-    },
-}]
-
-
-def _find_habits_sync(facts: list[dict]) -> list[dict]:
+def _find_habits_sync(facts: list[dict], known_types: list[str]) -> list[dict]:
     if len(facts) < HABIT_THRESHOLD:
         return []
     facts_text = "\n".join(f"- id={f['id']} type={f['type']} value=\"{f['value']}\"" for f in facts)
@@ -167,7 +192,7 @@ def _find_habits_sync(facts: list[dict]) -> list[dict]:
                 )},
                 {"role": "user", "content": f"Facts:\n{facts_text}"},
             ],
-            tools=CONSOLIDATE_TOOL,
+            tools=_make_consolidate_tool(known_types),
             tool_choice="required",
         )
         tool_calls = resp.choices[0].message.tool_calls
@@ -206,8 +231,9 @@ async def _consolidate_habits(username: str, auth_headers: dict):
         return
     logger.info(f"[{username}] {len(candidate_facts)} faits candidats (types: {[t for t, c in type_counts.items() if c >= HABIT_THRESHOLD]})")
 
+    known_types = sorted(set(f["type"] for f in all_facts)) or DEFAULT_FACT_TYPES
     loop = asyncio.get_event_loop()
-    habit_groups = await loop.run_in_executor(None, _find_habits_sync, candidate_facts)
+    habit_groups = await loop.run_in_executor(None, _find_habits_sync, candidate_facts, known_types)
 
     if not habit_groups:
         logger.info(f"[{username}] Aucune habitude détectée")
@@ -271,8 +297,11 @@ async def on_discussion(username: str, topic: str, payload, user_api_key: str):
         logger.error(f"[{username}] Échec stockage session dans mnemonic: {e}")
         return
 
+    known_types = await _fetch_known_types(username, auth_headers)
+    logger.info(f"[{username}] Types connus: {known_types}")
+
     logger.info(f"[{username}] Extraction des faits en cours...")
-    facts = await _extract_facts(payload)
+    facts = await _extract_facts(payload, known_types)
     if not facts:
         logger.info(f"[{username}] Aucun fait extrait")
         return

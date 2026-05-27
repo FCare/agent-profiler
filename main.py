@@ -480,16 +480,12 @@ async def on_user_connected(topic: str, payload):
         logger.warning(f"Topics manquants pour {username}, skip")
         return
 
-    if username in _subscribed_users:
-        logger.debug(f"Utilisateur {username} déjà abonné, skip")
-        return
-    _subscribed_users.add(username)
-
-    logger.info(f"Nouvel utilisateur: {username} — discussions={discussions_topic}")
-
-    nexus = NexusClient.from_api_key(VK_URL, MQTT_HOST, SERVICE_USERNAME, SERVICE_API_KEY, MQTT_PORT)
+    already_subscribed = username in _subscribed_users
 
     profile_topic = f"users/{username}/profile"
+    nexus = NexusClient.from_api_key(VK_URL, MQTT_HOST, SERVICE_USERNAME, SERVICE_API_KEY, MQTT_PORT)
+
+    # Always republish topic declaration so agents that restarted can rediscover it
     await nexus.publish(
         agent_topics_topic,
         [{
@@ -505,6 +501,14 @@ async def on_user_connected(topic: str, payload):
             }],
         }],
     )
+    logger.info(f"[{username}] Topics déclarés sur {agent_topics_topic}")
+
+    if already_subscribed:
+        logger.debug(f"[{username}] Déjà abonné aux discussions, skip souscription")
+        return
+
+    _subscribed_users.add(username)
+    logger.info(f"Nouvel utilisateur: {username} — discussions={discussions_topic}")
 
     await nexus.publish(
         profile_topic,
@@ -517,7 +521,7 @@ async def on_user_connected(topic: str, payload):
 
     nexus.subscribe(discussions_topic, handler)
     nexus.start_listening()
-    logger.info(f"Abonné aux discussions de {username}")
+    logger.info(f"[{username}] Abonné aux discussions")
 
 
 async def main():

@@ -77,7 +77,8 @@ def _extract_facts_sync(messages: list) -> list[dict]:
     system_prompt = (
         "You analyze conversations to extract personal facts about the human user (not the assistant). "
         "Only return facts explicitly mentioned in the conversation. "
-        "Always write fact values in English, regardless of the conversation language."
+        "Always write fact values in English, regardless of the conversation language. "
+        "Always call the extract_user_facts tool with the facts you find, even if there is only one."
     )
     logger.info(f"LLM POST {LLM_BASE_URL}/chat/completions — model={LLM_MODEL}")
     logger.info(f"System prompt: {system_prompt}")

@@ -90,7 +90,7 @@ def _extract_facts_sync(messages: list) -> list[dict]:
             model=LLM_MODEL,
             messages=[{"role": "system", "content": system_prompt}, *messages],
             tools=EXTRACT_TOOL,
-            tool_choice={"type": "function", "function": {"name": "extract_user_facts"}},
+            tool_choice="required",
         )
         logger.info(f"LLM response: {resp.choices[0].message}")
         tool_calls = resp.choices[0].message.tool_calls

@@ -510,12 +510,6 @@ async def on_user_connected(topic: str, payload):
     _subscribed_users.add(username)
     logger.info(f"Nouvel utilisateur: {username} — discussions={discussions_topic}")
 
-    await nexus.publish(
-        profile_topic,
-        {"username": username, "summary": ""},
-        retain=True,
-    )
-
     async def handler(t, p):
         await on_discussion(username, t, p, password, nexus, profile_topic)
 

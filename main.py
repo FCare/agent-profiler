@@ -194,12 +194,20 @@ async def _consolidate_habits(username: str, auth_headers: dict):
         return
 
     logger.info(f"[{username}] {len(all_facts)} faits récupérés (seuil: {HABIT_THRESHOLD})")
-    if len(all_facts) < HABIT_THRESHOLD:
-        logger.info(f"[{username}] Pas assez de faits pour consolidation")
+
+    type_counts = {}
+    for f in all_facts:
+        type_counts[f["type"]] = type_counts.get(f["type"], 0) + 1
+    logger.info(f"[{username}] Répartition par type: {type_counts}")
+
+    candidate_facts = [f for f in all_facts if type_counts[f["type"]] >= HABIT_THRESHOLD]
+    if not candidate_facts:
+        logger.info(f"[{username}] Aucun type avec ≥{HABIT_THRESHOLD} faits, pas de consolidation")
         return
+    logger.info(f"[{username}] {len(candidate_facts)} faits candidats (types: {[t for t, c in type_counts.items() if c >= HABIT_THRESHOLD]})")
 
     loop = asyncio.get_event_loop()
-    habit_groups = await loop.run_in_executor(None, _find_habits_sync, all_facts)
+    habit_groups = await loop.run_in_executor(None, _find_habits_sync, candidate_facts)
 
     if not habit_groups:
         logger.info(f"[{username}] Aucune habitude détectée")

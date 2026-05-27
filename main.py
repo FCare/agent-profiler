@@ -91,8 +91,13 @@ def _extract_facts_sync(messages: list) -> list[dict]:
             tools=EXTRACT_TOOL,
             tool_choice={"type": "function", "function": {"name": "extract_user_facts"}},
         )
-        args = resp.choices[0].message.tool_calls[0].function.arguments
-        logger.info(f"LLM response: {args}")
+        logger.info(f"LLM response: {resp.choices[0].message}")
+        tool_calls = resp.choices[0].message.tool_calls
+        if not tool_calls:
+            logger.warning("LLM n'a pas retourné de tool call")
+            return []
+        args = tool_calls[0].function.arguments
+        logger.info(f"LLM tool arguments: {args}")
         return json.loads(args).get("facts", [])
     except Exception as e:
         logger.error(f"Extraction de faits échouée: {e}")

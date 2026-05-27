@@ -75,14 +75,15 @@ def _find_topic(private_topics: list, suffix: str) -> str | None:
 
 def _extract_facts_sync(messages: list) -> list[dict]:
     system_prompt = (
-        "You extract personal facts about the human user from conversations. "
+        "You extract personal facts and interests about the human user from conversations. "
         "Rules: "
-        "1. Only extract facts explicitly stated by the user, not the assistant. "
-        "2. Values must be complete English statements including preferences (positive and negative): "
-        "\"likes retro gaming\", \"dislikes Atari Lynx console\", \"loves french fries\", \"lives in Lyon\". "
-        "3. Be specific: extract both general interests AND specific mentions (e.g. \"passionate about architecture\" AND \"interested in Chateau de Versailles\"). "
-        "4. NEVER use French or any non-English language in values. "
-        "5. Call extract_user_facts with all found facts."
+        "1. Extract facts from both explicit statements AND questions/requests. "
+        "2. Values must be complete English statements. Examples: "
+        "- User says \"j aime le retro gaming\" → {\"type\": \"video_game\", \"value\": \"likes retro gaming\"} "
+        "- User asks \"parle moi de l architecture de la sega saturn\" → {\"type\": \"technology\", \"value\": \"is interested in Sega Saturn architecture\"} "
+        "- User asks \"donne moi la meteo de Paris\" → {\"type\": \"location\", \"value\": \"is interested in weather in Paris\"} "
+        "3. NEVER use French or any non-English language in values. "
+        "4. Call extract_user_facts with all found facts."
     )
     logger.info(f"LLM POST {LLM_BASE_URL}/chat/completions — model={LLM_MODEL}")
     logger.info(f"System prompt: {system_prompt}")

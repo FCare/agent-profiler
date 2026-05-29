@@ -377,7 +377,13 @@ def _synthesize_search_sync(query: str, facts: list[dict]) -> str:
             max_tokens=150,
             temperature=0.1,
         )
-        return resp.choices[0].message.content.strip()
+        msg = resp.choices[0].message
+        logger.info(f"Synthèse LLM — content={msg.content!r} tool_calls={msg.tool_calls}")
+        content = msg.content
+        if not content:
+            logger.warning("Synthèse: content vide, fallback sur les valeurs brutes")
+            return ", ".join(f["value"] for f in facts)
+        return content.strip()
     except Exception as e:
         logger.error(f"Synthèse résultats échouée: {e}")
         return ", ".join(f["value"] for f in facts)

@@ -325,6 +325,54 @@ def _select_profile_types_sync(available_types: list[str]) -> list[str]:
         return []
 
 
+def _select_search_types_sync(query: str, available_types: list[str]) -> list[str]:
+    if not available_types:
+        return []
+    tool = [{
+        "type": "function",
+        "function": {
+            "name": "select_types",
+            "description": "Select the fact types relevant to the query.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "types": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "Types from the available list that would contain facts answering the query.",
+                    }
+                },
+                "required": ["types"],
+            },
+        },
+    }]
+    try:
+        client = openai.OpenAI(api_key=LLAMACPP_API_KEY, base_url=LLM_BASE_URL)
+        resp = client.chat.completions.create(
+            model=LLM_MODEL,
+            messages=[
+                {"role": "system", "content": (
+                    "Given a search query about a user's preferences or personal data, "
+                    "select the fact types from the available list that are most likely to contain relevant facts. "
+                    "Example: query='villes préférées' → types=['location']. "
+                    "Call select_types with the matching types."
+                )},
+                {"role": "user", "content": f"Query: {query}\nAvailable types: {', '.join(available_types)}"},
+            ],
+            tools=tool,
+            tool_choice="required",
+        )
+        tool_calls = resp.choices[0].message.tool_calls
+        if not tool_calls:
+            return []
+        result = json.loads(tool_calls[0].function.arguments).get("types", [])
+        logger.info(f"Types sélectionnés pour la recherche: {result}")
+        return [t for t in result if t in available_types]
+    except Exception as e:
+        logger.error(f"Sélection des types de recherche échouée: {e}")
+        return []
+
+
 def _build_profile_sync(username: str, personal_facts: list[dict], habits: list[dict]) -> str:
     lines = []
     if personal_facts:
@@ -596,23 +644,55 @@ async def on_user_connected(topic: str, payload):
         if not query:
             return
         logger.info(f"[{username}] Recherche de faits: {query!r} (n={n})")
-        try:
-            async with aiohttp.ClientSession(headers=auth_headers) as http:
-                resp = await http.get(
-                    f"{MNEMONIC_URL}/users/{username}/facts/search",
-                    params={"q": query, "n": n},
-                )
-                resp.raise_for_status()
-                results = await resp.json()
-        except Exception as e:
-            logger.error(f"[{username}] Échec recherche: {e}")
-            return
-        logger.info(f"[{username}] Mnemonic résultats ({len(results)}): {results}")
+
         loop = asyncio.get_event_loop()
-        answer = await loop.run_in_executor(None, _synthesize_search_sync, query, results)
+
+        # 1. Fetch available types
+        available_types = await _fetch_known_types(username, auth_headers)
+        logger.info(f"[{username}] Types disponibles: {available_types}")
+
+        # 2. LLM selects relevant types for this query
+        selected_types = await loop.run_in_executor(
+            None, _select_search_types_sync, query, available_types
+        )
+        logger.info(f"[{username}] Types retenus pour la recherche: {selected_types}")
+
+        # 3. Fetch facts by type; fall back to semantic search if no types matched
+        facts = []
+        if selected_types:
+            try:
+                async with aiohttp.ClientSession(headers=auth_headers) as http:
+                    for fact_type in selected_types:
+                        resp = await http.get(
+                            f"{MNEMONIC_URL}/users/{username}/facts",
+                            params={"fact_type": fact_type},
+                        )
+                        resp.raise_for_status()
+                        facts.extend(await resp.json())
+                logger.info(f"[{username}] {len(facts)} faits récupérés par type: {facts}")
+            except Exception as e:
+                logger.error(f"[{username}] Échec récupération par type: {e}")
+
+        if not facts:
+            logger.info(f"[{username}] Fallback sur la recherche sémantique")
+            try:
+                async with aiohttp.ClientSession(headers=auth_headers) as http:
+                    resp = await http.get(
+                        f"{MNEMONIC_URL}/users/{username}/facts/search",
+                        params={"q": query, "n": n},
+                    )
+                    resp.raise_for_status()
+                    facts = await resp.json()
+                logger.info(f"[{username}] Mnemonic résultats sémantiques ({len(facts)}): {facts}")
+            except Exception as e:
+                logger.error(f"[{username}] Échec recherche sémantique: {e}")
+                return
+
+        # 4. LLM synthesizes a focused answer
+        answer = await loop.run_in_executor(None, _synthesize_search_sync, query, facts)
         logger.info(f"[{username}] Synthèse: {answer!r}")
         await nexus.publish(search_results_topic, {"query": query, "answer": answer})
-        logger.info(f"[{username}] Résultats synthétisés publiés sur {search_results_topic}")
+        logger.info(f"[{username}] Résultats publiés sur {search_results_topic}")
 
     async def on_delete_request(t, p):
         if not isinstance(p, dict):

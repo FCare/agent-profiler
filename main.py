@@ -450,10 +450,14 @@ def _build_profile_sync(username: str, personal_facts: list[dict], habits: list[
             model=LLM_MODEL,
             messages=[
                 {"role": "system", "content": (
-                    "Generate a concise personal profile of the user from the provided facts and habits. "
+                    "Generate a concise personal profile of the user strictly from the provided facts and habits. "
                     "Write in third person, in English. "
-                    "Start with personal info (name, location, occupation, family if known), then describe recurring habits and interests. "
-                    "Be factual, concise, and natural-sounding. 3-6 sentences."
+                    "STRICT RULES: "
+                    "(1) Only state what is explicitly in the facts — never infer, guess, or add context. "
+                    "(2) Do not add geographic, cultural, or demographic details not present in the facts. "
+                    "(3) An interest in weather for a location does NOT mean the user lives there — do not write 'resides in' or 'lives in' unless a fact explicitly states it. "
+                    "(4) Never use words like 'likely', 'probably', 'apparently', 'seems to'. "
+                    "Describe only what is known. 1-4 sentences."
                 )},
                 {"role": "user", "content": f"User: {username}\n\n{context}"},
             ],

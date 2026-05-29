@@ -532,7 +532,7 @@ async def on_user_connected(topic: str, payload):
     _subscribed_users.add(username)
     logger.info(f"Nouvel utilisateur: {username} — discussions={discussions_topic}")
 
-    auth_headers = {"Authorization": f"Bearer {password}"}
+    auth_headers = {"Cookie": f"vk_session={password}"}
 
     async def handler(t, p):
         await on_discussion(username, t, p, password, nexus, profile_topic)

@@ -640,6 +640,7 @@ async def on_user_connected(topic: str, payload):
     search_topic = f"users/{username}/search_preference"
     delete_topic = f"users/{username}/delete_facts"
     search_results_topic = f"users/{username}/search_results"
+    delete_results_topic = f"users/{username}/delete_results"
 
     # Always republish topic declaration so agents that restarted can rediscover it
     await nexus.publish(
@@ -662,8 +663,9 @@ async def on_user_connected(topic: str, payload):
                 },
                 {
                     "topic": delete_topic,
-                    "description": "Suppression de faits (par id ou recherche sémantique)",
+                    "description": "Suppression de faits (par id ou par sujet)",
                     "access": "write",
+                    "response_topic": delete_results_topic,
                     "format": {"query": "string (OR) ids: [\"...\"]"},
                 },
                 {
@@ -671,6 +673,12 @@ async def on_user_connected(topic: str, payload):
                     "description": "Réponse synthétisée à la dernière recherche de faits",
                     "access": "read",
                     "format": {"query": "string", "answer": "string"},
+                },
+                {
+                    "topic": delete_results_topic,
+                    "description": "Résultat de la dernière suppression de faits",
+                    "access": "read",
+                    "format": {"query": "string", "deleted_count": "int", "deleted": ["string"]},
                 },
             ],
         }],
@@ -755,6 +763,8 @@ async def on_user_connected(topic: str, payload):
         if not ids and not query:
             return
 
+        deleted_labels = []
+
         if ids:
             logger.info(f"[{username}] Suppression par ids: {ids}")
             async with aiohttp.ClientSession(headers=auth_headers) as http:
@@ -762,63 +772,74 @@ async def on_user_connected(topic: str, payload):
                     try:
                         resp = await http.delete(f"{MNEMONIC_URL}/users/{username}/facts/{fact_id}")
                         resp.raise_for_status()
+                        deleted_labels.append(fact_id)
                         logger.info(f"[{username}] Fait supprimé: {fact_id}")
                     except Exception as e:
                         logger.error(f"[{username}] Échec suppression {fact_id}: {e}")
-            return
+        else:
+            logger.info(f"[{username}] Suppression par recherche: {query!r}")
 
-        logger.info(f"[{username}] Suppression par recherche: {query!r}")
+            loop = asyncio.get_event_loop()
 
-        loop = asyncio.get_event_loop()
+            # 1. Find relevant types for this query
+            available_types = await _fetch_known_types(username, auth_headers)
+            selected_types = await loop.run_in_executor(
+                None, _select_search_types_sync, query, available_types
+            )
+            logger.info(f"[{username}] Types retenus pour suppression: {selected_types}")
 
-        # 1. Find relevant types for this query
-        available_types = await _fetch_known_types(username, auth_headers)
-        selected_types = await loop.run_in_executor(
-            None, _select_search_types_sync, query, available_types
-        )
-        logger.info(f"[{username}] Types retenus pour suppression: {selected_types}")
+            # 2. Fetch candidate facts by type
+            candidates = []
+            if selected_types:
+                try:
+                    async with aiohttp.ClientSession(headers=auth_headers) as http:
+                        for fact_type in selected_types:
+                            resp = await http.get(
+                                f"{MNEMONIC_URL}/users/{username}/facts",
+                                params={"fact_type": fact_type},
+                            )
+                            resp.raise_for_status()
+                            candidates.extend(await resp.json())
+                    logger.info(f"[{username}] {len(candidates)} candidats à la suppression")
+                except Exception as e:
+                    logger.error(f"[{username}] Échec récupération candidats: {e}")
+                    await nexus.publish(delete_results_topic, {"query": query, "deleted_count": 0, "deleted": []})
+                    return
 
-        # 2. Fetch candidate facts by type
-        candidates = []
-        if selected_types:
-            try:
-                async with aiohttp.ClientSession(headers=auth_headers) as http:
-                    for fact_type in selected_types:
-                        resp = await http.get(
-                            f"{MNEMONIC_URL}/users/{username}/facts",
-                            params={"fact_type": fact_type},
-                        )
-                        resp.raise_for_status()
-                        candidates.extend(await resp.json())
-                logger.info(f"[{username}] {len(candidates)} candidats à la suppression")
-            except Exception as e:
-                logger.error(f"[{username}] Échec récupération candidats: {e}")
+            if not candidates:
+                logger.info(f"[{username}] Aucun candidat trouvé pour suppression: {query!r}")
+                await nexus.publish(delete_results_topic, {"query": query, "deleted_count": 0, "deleted": []})
                 return
 
-        if not candidates:
-            logger.info(f"[{username}] Aucun candidat trouvé pour suppression: {query!r}")
-            return
+            # 3. LLM filters to only facts that truly match the query
+            ids_to_delete = await loop.run_in_executor(
+                None, _filter_facts_for_deletion_sync, query, candidates
+            )
+            logger.info(f"[{username}] {len(ids_to_delete)}/{len(candidates)} faits retenus pour suppression: {ids_to_delete}")
 
-        # 3. LLM filters to only facts that truly match the query
-        ids_to_delete = await loop.run_in_executor(
-            None, _filter_facts_for_deletion_sync, query, candidates
+            if not ids_to_delete:
+                logger.info(f"[{username}] Aucun fait ne correspond à la suppression: {query!r}")
+                await nexus.publish(delete_results_topic, {"query": query, "deleted_count": 0, "deleted": []})
+                return
+
+            # 4. Delete only the filtered facts
+            async with aiohttp.ClientSession(headers=auth_headers) as http:
+                for fact_id in ids_to_delete:
+                    try:
+                        resp = await http.delete(f"{MNEMONIC_URL}/users/{username}/facts/{fact_id}")
+                        resp.raise_for_status()
+                        fact = next((f for f in candidates if f["id"] == fact_id), {})
+                        label = f"{fact.get('type')}: {fact.get('value')}"
+                        deleted_labels.append(label)
+                        logger.info(f"[{username}] Fait supprimé: {fact_id} ({label})")
+                    except Exception as e:
+                        logger.error(f"[{username}] Échec suppression {fact_id}: {e}")
+
+        await nexus.publish(
+            delete_results_topic,
+            {"query": query or str(ids), "deleted_count": len(deleted_labels), "deleted": deleted_labels},
         )
-        logger.info(f"[{username}] {len(ids_to_delete)}/{len(candidates)} faits retenus pour suppression: {ids_to_delete}")
-
-        if not ids_to_delete:
-            logger.info(f"[{username}] Aucun fait ne correspond à la suppression: {query!r}")
-            return
-
-        # 4. Delete only the filtered facts
-        async with aiohttp.ClientSession(headers=auth_headers) as http:
-            for fact_id in ids_to_delete:
-                try:
-                    resp = await http.delete(f"{MNEMONIC_URL}/users/{username}/facts/{fact_id}")
-                    resp.raise_for_status()
-                    fact = next((f for f in candidates if f["id"] == fact_id), {})
-                    logger.info(f"[{username}] Fait supprimé: {fact_id} ({fact.get('type')}: {fact.get('value')})")
-                except Exception as e:
-                    logger.error(f"[{username}] Échec suppression {fact_id}: {e}")
+        logger.info(f"[{username}] Résultat suppression publié: {len(deleted_labels)} faits supprimés")
 
     nexus.subscribe(discussions_topic, handler)
     nexus.subscribe(search_topic, on_search_request)

@@ -361,29 +361,48 @@ def _synthesize_search_sync(query: str, facts: list[dict]) -> str:
     if not facts:
         return "Aucun résultat trouvé."
     facts_text = "\n".join(f"- [{f['type']}] {f['value']}" for f in facts)
+    tool = [{
+        "type": "function",
+        "function": {
+            "name": "report_answer",
+            "description": "Report the answer extracted from the facts.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "answer": {
+                        "type": "string",
+                        "description": (
+                            "The values from the facts that directly answer the query, as a short comma-separated list. "
+                            "If no facts are relevant, return 'Aucune information trouvée.'"
+                        ),
+                    }
+                },
+                "required": ["answer"],
+            },
+        },
+    }]
     try:
         client = openai.OpenAI(api_key=LLAMACPP_API_KEY, base_url=LLM_BASE_URL)
         resp = client.chat.completions.create(
             model=LLM_MODEL,
             messages=[
                 {"role": "system", "content": (
-                    "You are given a list of stored facts about a user and a query. "
-                    "Extract ONLY the values that directly answer the query. "
-                    "Return a short, factual list — no explanation, no extra context, no tool calls. "
-                    "Example: query='favourite sports' facts=[sport: football, sport: tennis] → 'football, tennis'"
+                    "You are given stored facts about a user and a query. "
+                    "Call report_answer with the values that directly answer the query. "
+                    "Example: query='favourite sports' facts=[sport: football, sport: tennis] → answer='football, tennis'"
                 )},
                 {"role": "user", "content": f"Query: {query}\n\nFacts:\n{facts_text}"},
             ],
-            max_tokens=150,
-            temperature=0.1,
+            tools=tool,
+            tool_choice="required",
         )
-        msg = resp.choices[0].message
-        content = msg.content
-        logger.info(f"Synthèse LLM — content={content!r} tool_calls={msg.tool_calls}")
-        if not content or content.strip().lower() in ("none", "null", ""):
-            logger.warning("Synthèse: contenu invalide, fallback sur les valeurs brutes")
+        tool_calls = resp.choices[0].message.tool_calls
+        if not tool_calls:
+            logger.warning("Synthèse: pas de tool call, fallback sur les valeurs brutes")
             return ", ".join(f["value"] for f in facts)
-        return content.strip()
+        answer = json.loads(tool_calls[0].function.arguments).get("answer", "")
+        logger.info(f"Synthèse LLM — answer={answer!r}")
+        return answer or ", ".join(f["value"] for f in facts)
     except Exception as e:
         logger.error(f"Synthèse résultats échouée: {e}")
         return ", ".join(f["value"] for f in facts)

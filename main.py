@@ -497,9 +497,13 @@ def _filter_facts_for_deletion_sync(query: str, facts: list[dict]) -> list[str]:
             messages=[
                 {"role": "system", "content": (
                     "You are given a deletion query and a list of user facts. "
-                    "Select ONLY the IDs of facts that directly and explicitly match the query subject. "
+                    "Select ONLY the IDs of facts that match BOTH the subject AND the intent of the query. "
                     "Be conservative — when in doubt, do NOT include the fact. "
-                    "Example: query='Marseille' → only include facts mentioning Marseille, NOT generic weather facts or other cities."
+                    "Examples:\n"
+                    "- query='météo sur Paris' → select facts about weather interest in Paris "
+                    "(e.g. 'is interested in weather in Paris'), NOT facts about living in Paris or Paris being a favourite city.\n"
+                    "- query='Marseille' (no context) → select facts that mention Marseille in any context.\n"
+                    "- query='retro gaming' → select facts about retro gaming interest only, not general gaming facts."
                 )},
                 {"role": "user", "content": f"Query: {query}\n\nFacts:\n{facts_text}"},
             ],

@@ -728,10 +728,11 @@ async def on_user_connected(topic: str, payload):
                     "topic": delete_topic,
                     "description": (
                         "Supprime des faits mémorisés. "
-                        "UNIQUEMENT si l'utilisateur demande EXPLICITEMENT de supprimer, effacer ou oublier quelque chose "
-                        "(ex: 'supprime', 'efface', 'oublie', 'retire de ta mémoire'). "
-                        "NE PAS utiliser si l'utilisateur dit simplement qu'il ne s'intéresse plus à quelque chose "
-                        "ou exprime une préférence changeante sans demander explicitement la suppression."
+                        "Utiliser quand l'utilisateur (1) demande explicitement de supprimer/effacer/oublier quelque chose, "
+                        "OU (2) déclare clairement qu'il ne s'intéresse plus à quelque chose "
+                        "(ex: 'la météo ne m'intéresse plus', 'je n'aime plus le retro gaming'). "
+                        "NE PAS utiliser si c'est un commentaire passager dans une demande d'action "
+                        "(ex: 'donne-moi la météo' ne doit PAS déclencher une suppression)."
                     ),
                     "access": "write",
                     "response_topic": delete_results_topic,

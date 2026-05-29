@@ -389,7 +389,7 @@ def _select_deletion_types_sync(query: str, available_types: list[str]) -> list[
                         "type": "array",
                         "items": {"type": "string"},
                         "description": (
-                            "Only the 1 or 2 types whose facts would directly name the subject. "
+                            "Only the types whose facts would directly name the subject. "
                             "Do NOT select associative types (e.g. for 'Paris weather' → ['location'] only, "
                             "NOT cuisine/cinema/philosophy even if Paris is associated with them)."
                         ),
@@ -413,7 +413,7 @@ def _select_deletion_types_sync(query: str, available_types: list[str]) -> list[
                     "- query='Paris weather' → ['location'] (a location fact might say 'is interested in weather in Paris')\n"
                     "- query='retro gaming' → ['video_game']\n"
                     "- query='François' → ['name', 'person']\n"
-                    "Call select_types with at most 2 types."
+                    "Call select_types with all directly relevant types."
                 )},
                 {"role": "user", "content": f"Query: {query}\nAvailable types: {', '.join(available_types)}"},
             ],

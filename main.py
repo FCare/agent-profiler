@@ -378,10 +378,10 @@ def _synthesize_search_sync(query: str, facts: list[dict]) -> str:
             temperature=0.1,
         )
         msg = resp.choices[0].message
-        logger.info(f"Synthèse LLM — content={msg.content!r} tool_calls={msg.tool_calls}")
         content = msg.content
-        if not content:
-            logger.warning("Synthèse: content vide, fallback sur les valeurs brutes")
+        logger.info(f"Synthèse LLM — content={content!r} tool_calls={msg.tool_calls}")
+        if not content or content.strip().lower() in ("none", "null", ""):
+            logger.warning("Synthèse: contenu invalide, fallback sur les valeurs brutes")
             return ", ".join(f["value"] for f in facts)
         return content.strip()
     except Exception as e:
@@ -588,6 +588,7 @@ async def on_user_connected(topic: str, payload):
         except Exception as e:
             logger.error(f"[{username}] Échec recherche: {e}")
             return
+        logger.info(f"[{username}] Mnemonic résultats ({len(results)}): {results}")
         loop = asyncio.get_event_loop()
         answer = await loop.run_in_executor(None, _synthesize_search_sync, query, results)
         logger.info(f"[{username}] Synthèse: {answer!r}")

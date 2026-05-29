@@ -357,6 +357,32 @@ def _build_profile_sync(username: str, personal_facts: list[dict], habits: list[
         return ""
 
 
+def _synthesize_search_sync(query: str, facts: list[dict]) -> str:
+    if not facts:
+        return "Aucun résultat trouvé."
+    facts_text = "\n".join(f"- [{f['type']}] {f['value']}" for f in facts)
+    try:
+        client = openai.OpenAI(api_key=LLAMACPP_API_KEY, base_url=LLM_BASE_URL)
+        resp = client.chat.completions.create(
+            model=LLM_MODEL,
+            messages=[
+                {"role": "system", "content": (
+                    "You are given a list of stored facts about a user and a query. "
+                    "Extract ONLY the values that directly answer the query. "
+                    "Return a short, factual list — no explanation, no extra context, no tool calls. "
+                    "Example: query='favourite sports' facts=[sport: football, sport: tennis] → 'football, tennis'"
+                )},
+                {"role": "user", "content": f"Query: {query}\n\nFacts:\n{facts_text}"},
+            ],
+            max_tokens=150,
+            temperature=0.1,
+        )
+        return resp.choices[0].message.content.strip()
+    except Exception as e:
+        logger.error(f"Synthèse résultats échouée: {e}")
+        return ", ".join(f["value"] for f in facts)
+
+
 async def _generate_profile(username: str, auth_headers: dict, nexus, profile_topic: str):
     logger.info(f"[{username}] Génération du profil...")
     try:
@@ -516,9 +542,9 @@ async def on_user_connected(topic: str, payload):
                 },
                 {
                     "topic": search_results_topic,
-                    "description": "Résultats de la dernière recherche de faits",
+                    "description": "Réponse synthétisée à la dernière recherche de faits",
                     "access": "read",
-                    "format": [{"id": "string", "type": "string", "value": "string"}],
+                    "format": {"query": "string", "answer": "string"},
                 },
             ],
         }],
@@ -556,8 +582,11 @@ async def on_user_connected(topic: str, payload):
         except Exception as e:
             logger.error(f"[{username}] Échec recherche: {e}")
             return
-        await nexus.publish(search_results_topic, results)
-        logger.info(f"[{username}] {len(results)} résultats publiés sur {search_results_topic}")
+        loop = asyncio.get_event_loop()
+        answer = await loop.run_in_executor(None, _synthesize_search_sync, query, results)
+        logger.info(f"[{username}] Synthèse: {answer!r}")
+        await nexus.publish(search_results_topic, {"query": query, "answer": answer})
+        logger.info(f"[{username}] Résultats synthétisés publiés sur {search_results_topic}")
 
     async def on_delete_request(t, p):
         if not isinstance(p, dict):

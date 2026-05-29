@@ -405,6 +405,59 @@ def _build_profile_sync(username: str, personal_facts: list[dict], habits: list[
         return ""
 
 
+def _filter_facts_for_deletion_sync(query: str, facts: list[dict]) -> list[str]:
+    if not facts:
+        return []
+    facts_text = "\n".join(f"- id={f['id']} type={f['type']} value=\"{f['value']}\"" for f in facts)
+    tool = [{
+        "type": "function",
+        "function": {
+            "name": "select_facts_to_delete",
+            "description": "Select the IDs of facts that match the deletion query.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "ids": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": (
+                            "IDs of facts that directly and explicitly match the query. "
+                            "Be conservative: only include facts that clearly reference the subject. "
+                            "If unsure, exclude."
+                        ),
+                    }
+                },
+                "required": ["ids"],
+            },
+        },
+    }]
+    try:
+        client = openai.OpenAI(api_key=LLAMACPP_API_KEY, base_url=LLM_BASE_URL)
+        resp = client.chat.completions.create(
+            model=LLM_MODEL,
+            messages=[
+                {"role": "system", "content": (
+                    "You are given a deletion query and a list of user facts. "
+                    "Select ONLY the IDs of facts that directly and explicitly match the query subject. "
+                    "Be conservative — when in doubt, do NOT include the fact. "
+                    "Example: query='Marseille' → only include facts mentioning Marseille, NOT generic weather facts or other cities."
+                )},
+                {"role": "user", "content": f"Query: {query}\n\nFacts:\n{facts_text}"},
+            ],
+            tools=tool,
+            tool_choice="required",
+        )
+        tool_calls = resp.choices[0].message.tool_calls
+        if not tool_calls:
+            return []
+        ids = json.loads(tool_calls[0].function.arguments).get("ids", [])
+        valid_ids = {f["id"] for f in facts}
+        return [fid for fid in ids if fid in valid_ids]
+    except Exception as e:
+        logger.error(f"Filtrage suppression échoué: {e}")
+        return []
+
+
 def _synthesize_search_sync(query: str, facts: list[dict]) -> str:
     if not facts:
         return "Aucun résultat trouvé."
@@ -701,34 +754,71 @@ async def on_user_connected(topic: str, payload):
         query = p.get("query", "")
         if not ids and not query:
             return
-        async with aiohttp.ClientSession(headers=auth_headers) as http:
-            if ids:
-                logger.info(f"[{username}] Suppression par ids: {ids}")
+
+        if ids:
+            logger.info(f"[{username}] Suppression par ids: {ids}")
+            async with aiohttp.ClientSession(headers=auth_headers) as http:
                 for fact_id in ids:
                     try:
                         resp = await http.delete(f"{MNEMONIC_URL}/users/{username}/facts/{fact_id}")
                         resp.raise_for_status()
+                        logger.info(f"[{username}] Fait supprimé: {fact_id}")
                     except Exception as e:
                         logger.error(f"[{username}] Échec suppression {fact_id}: {e}")
-            else:
-                logger.info(f"[{username}] Suppression par recherche: {query!r}")
-                try:
-                    resp = await http.get(
-                        f"{MNEMONIC_URL}/users/{username}/facts/search",
-                        params={"q": query, "n": 50},
-                    )
-                    resp.raise_for_status()
-                    results = await resp.json()
-                except Exception as e:
-                    logger.error(f"[{username}] Échec recherche pour suppression: {e}")
-                    return
-                for fact in results:
-                    try:
-                        resp = await http.delete(f"{MNEMONIC_URL}/users/{username}/facts/{fact['id']}")
+            return
+
+        logger.info(f"[{username}] Suppression par recherche: {query!r}")
+
+        loop = asyncio.get_event_loop()
+
+        # 1. Find relevant types for this query
+        available_types = await _fetch_known_types(username, auth_headers)
+        selected_types = await loop.run_in_executor(
+            None, _select_search_types_sync, query, available_types
+        )
+        logger.info(f"[{username}] Types retenus pour suppression: {selected_types}")
+
+        # 2. Fetch candidate facts by type
+        candidates = []
+        if selected_types:
+            try:
+                async with aiohttp.ClientSession(headers=auth_headers) as http:
+                    for fact_type in selected_types:
+                        resp = await http.get(
+                            f"{MNEMONIC_URL}/users/{username}/facts",
+                            params={"fact_type": fact_type},
+                        )
                         resp.raise_for_status()
-                        logger.info(f"[{username}] Fait supprimé: {fact['id']} ({fact.get('type')}: {fact.get('value')})")
-                    except Exception as e:
-                        logger.error(f"[{username}] Échec suppression {fact['id']}: {e}")
+                        candidates.extend(await resp.json())
+                logger.info(f"[{username}] {len(candidates)} candidats à la suppression")
+            except Exception as e:
+                logger.error(f"[{username}] Échec récupération candidats: {e}")
+                return
+
+        if not candidates:
+            logger.info(f"[{username}] Aucun candidat trouvé pour suppression: {query!r}")
+            return
+
+        # 3. LLM filters to only facts that truly match the query
+        ids_to_delete = await loop.run_in_executor(
+            None, _filter_facts_for_deletion_sync, query, candidates
+        )
+        logger.info(f"[{username}] {len(ids_to_delete)}/{len(candidates)} faits retenus pour suppression: {ids_to_delete}")
+
+        if not ids_to_delete:
+            logger.info(f"[{username}] Aucun fait ne correspond à la suppression: {query!r}")
+            return
+
+        # 4. Delete only the filtered facts
+        async with aiohttp.ClientSession(headers=auth_headers) as http:
+            for fact_id in ids_to_delete:
+                try:
+                    resp = await http.delete(f"{MNEMONIC_URL}/users/{username}/facts/{fact_id}")
+                    resp.raise_for_status()
+                    fact = next((f for f in candidates if f["id"] == fact_id), {})
+                    logger.info(f"[{username}] Fait supprimé: {fact_id} ({fact.get('type')}: {fact.get('value')})")
+                except Exception as e:
+                    logger.error(f"[{username}] Échec suppression {fact_id}: {e}")
 
     nexus.subscribe(discussions_topic, handler)
     nexus.subscribe(search_topic, on_search_request)

@@ -118,6 +118,8 @@ EXTRACT_SYSTEM_PROMPT = (
     "Every [user] line reveals at least one fact: questions reveal interests, requests reveal needs, statements reveal preferences. "
     "Values must be complete English statements, never French. "
     "Examples:\n"
+    "- [user]: je m'appelle François → {type: \"name\", value: \"is named François\"}\n"
+    "- [user]: mon prénom c'est Marie → {type: \"name\", value: \"is named Marie\"}\n"
     "- [user]: quelle meteo demain a paris → {type: \"location\", value: \"is interested in weather in Paris\"}\n"
     "- [user]: j aime le retro gaming → {type: \"video_game\", value: \"likes retro gaming\"}\n"
     "- [user]: tu connais le cycle de Hain? / [assistant]: c'est une série SF / [user]: c'est plusieurs livres → {type: \"book\", value: \"is interested in the Hain cycle\"}\n"
@@ -318,6 +320,9 @@ def _select_profile_types_sync(available_types: list[str]) -> list[str]:
         if not tool_calls:
             return []
         result = json.loads(tool_calls[0].function.arguments).get("types", [])
+        # Always include "name" if it exists — it's the most fundamental personal attribute
+        if "name" in available_types and "name" not in result:
+            result = ["name"] + result
         logger.info(f"Types de profil sélectionnés: {result}")
         return result
     except Exception as e:
@@ -896,7 +901,8 @@ async def on_user_connected(topic: str, payload):
                 await nexus.publish(delete_results_topic, {"query": query, "deleted_count": 0, "deleted": []})
                 return
 
-            # 4. Delete only the filtered facts
+            # 4. Delete only the filtered facts, collecting associated session_ids
+            session_ids_to_delete = set()
             async with aiohttp.ClientSession(headers=auth_headers) as http:
                 for fact_id in ids_to_delete:
                     try:
@@ -905,9 +911,22 @@ async def on_user_connected(topic: str, payload):
                         fact = next((f for f in candidates if f["id"] == fact_id), {})
                         label = f"{fact.get('type')}: {fact.get('value')}"
                         deleted_labels.append(label)
+                        if fact.get("session_id"):
+                            session_ids_to_delete.add(fact["session_id"])
                         logger.info(f"[{username}] Fait supprimé: {fact_id} ({label})")
                     except Exception as e:
                         logger.error(f"[{username}] Échec suppression {fact_id}: {e}")
+
+            # 5. Delete associated sessions
+            if session_ids_to_delete:
+                async with aiohttp.ClientSession(headers=auth_headers) as http:
+                    for session_id in session_ids_to_delete:
+                        try:
+                            resp = await http.delete(f"{MNEMONIC_URL}/users/{username}/sessions/{session_id}")
+                            resp.raise_for_status()
+                            logger.info(f"[{username}] Session supprimée: {session_id}")
+                        except Exception as e:
+                            logger.error(f"[{username}] Échec suppression session {session_id}: {e}")
 
         await nexus.publish(
             delete_results_topic,

@@ -373,6 +373,65 @@ def _select_search_types_sync(query: str, available_types: list[str]) -> list[st
         return []
 
 
+def _select_deletion_types_sync(query: str, available_types: list[str]) -> list[str]:
+    """Like _select_search_types_sync but strict: only types whose facts explicitly name the subject."""
+    if not available_types:
+        return []
+    tool = [{
+        "type": "function",
+        "function": {
+            "name": "select_types",
+            "description": "Select fact types whose stored facts would explicitly mention the deletion subject.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "types": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": (
+                            "Only the 1 or 2 types whose facts would directly name the subject. "
+                            "Do NOT select associative types (e.g. for 'Paris weather' → ['location'] only, "
+                            "NOT cuisine/cinema/philosophy even if Paris is associated with them)."
+                        ),
+                    }
+                },
+                "required": ["types"],
+            },
+        },
+    }]
+    try:
+        client = openai.OpenAI(api_key=LLAMACPP_API_KEY, base_url=LLM_BASE_URL)
+        resp = client.chat.completions.create(
+            model=LLM_MODEL,
+            messages=[
+                {"role": "system", "content": (
+                    "For a deletion query, select ONLY the 1 or 2 fact types that would contain facts "
+                    "directly and explicitly naming the subject. "
+                    "Think: which type stores a fact whose value would literally contain the subject word? "
+                    "Ignore cultural or thematic associations. "
+                    "Examples:\n"
+                    "- query='Paris weather' → ['location'] (a location fact might say 'is interested in weather in Paris')\n"
+                    "- query='retro gaming' → ['video_game']\n"
+                    "- query='François' → ['name', 'person']\n"
+                    "Call select_types with at most 2 types."
+                )},
+                {"role": "user", "content": f"Query: {query}\nAvailable types: {', '.join(available_types)}"},
+            ],
+            tools=tool,
+            tool_choice="required",
+        )
+        tool_calls = resp.choices[0].message.tool_calls
+        if not tool_calls:
+            return []
+        result = json.loads(tool_calls[0].function.arguments).get("types", [])
+        filtered = [t for t in result if t in available_types]
+        logger.info(f"Types sélectionnés pour suppression: {filtered}")
+        return filtered
+    except Exception as e:
+        logger.error(f"Sélection des types de suppression échouée: {e}")
+        return []
+
+
 def _build_profile_sync(username: str, personal_facts: list[dict], habits: list[dict]) -> str:
     lines = []
     if personal_facts:
@@ -663,7 +722,13 @@ async def on_user_connected(topic: str, payload):
                 },
                 {
                     "topic": delete_topic,
-                    "description": "Suppression de faits (par id ou par sujet)",
+                    "description": (
+                        "Supprime des faits mémorisés. "
+                        "UNIQUEMENT si l'utilisateur demande EXPLICITEMENT de supprimer, effacer ou oublier quelque chose "
+                        "(ex: 'supprime', 'efface', 'oublie', 'retire de ta mémoire'). "
+                        "NE PAS utiliser si l'utilisateur dit simplement qu'il ne s'intéresse plus à quelque chose "
+                        "ou exprime une préférence changeante sans demander explicitement la suppression."
+                    ),
                     "access": "write",
                     "response_topic": delete_results_topic,
                     "format": {"query": "string (OR) ids: [\"...\"]"},
@@ -781,10 +846,10 @@ async def on_user_connected(topic: str, payload):
 
             loop = asyncio.get_event_loop()
 
-            # 1. Find relevant types for this query
+            # 1. Find directly relevant types for this query (strict, max 2)
             available_types = await _fetch_known_types(username, auth_headers)
             selected_types = await loop.run_in_executor(
-                None, _select_search_types_sync, query, available_types
+                None, _select_deletion_types_sync, query, available_types
             )
             logger.info(f"[{username}] Types retenus pour suppression: {selected_types}")
 

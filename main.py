@@ -728,7 +728,13 @@ async def on_user_connected(topic: str, payload):
                 },
                 {
                     "topic": search_topic,
-                    "description": "Recherche sémantique de faits utilisateur",
+                    "description": (
+                        "Recherche dans la mémoire de l'utilisateur. "
+                        "Utiliser quand l'utilisateur pose une question sur ses propres données, préférences ou habitudes "
+                        "(ex: 'quels sont mes lieux habituels ?', 'est-ce que j'aime le jazz ?'), "
+                        "ou quand une réponse nécessite une information personnelle avant d'agir "
+                        "(ex: 'météo de mes lieux habituels' → chercher 'lieux habituels' AVANT de répondre)."
+                    ),
                     "access": "write",
                     "response_topic": search_results_topic,
                     "format": {"query": "string", "n": 5},

@@ -581,6 +581,33 @@ def _synthesize_search_sync(query: str, facts: list[dict]) -> str:
         return ", ".join(f["value"] for f in facts)
 
 
+def _extract_fact_for_save_sync(statement: str, known_types: list[str]) -> dict | None:
+    prompt = (
+        f"Extrait un fait personnel à partir de cette déclaration utilisateur : \"{statement}\"\n"
+        f"Types connus : {', '.join(known_types)}\n"
+        "Retourne un objet JSON avec les clés 'type' et 'value'. "
+        "Exemple : {\"type\": \"cuisine\", \"value\": \"aime les restaurants japonais\"}"
+    )
+    try:
+        client = openai.OpenAI(api_key=LLAMACPP_API_KEY, base_url=LLM_BASE_URL)
+        resp = client.chat.completions.create(
+            model=LLM_MODEL,
+            messages=[{"role": "user", "content": prompt}],
+            max_tokens=64,
+            temperature=0.0,
+            stream=False,
+        )
+        raw = resp.choices[0].message.content.strip()
+        start = raw.find("{")
+        end = raw.rfind("}") + 1
+        if start == -1 or end == 0:
+            return None
+        return json.loads(raw[start:end])
+    except Exception as e:
+        logger.error(f"Extraction fait échouée: {e}")
+        return None
+
+
 async def _generate_profile(username: str, auth_headers: dict, nexus, profile_topic: str):
     logger.info(f"[{username}] Génération du profil...")
     try:
@@ -711,8 +738,10 @@ async def on_user_connected(topic: str, payload):
 
     search_topic = f"users/{username}/search_preference"
     delete_topic = f"users/{username}/delete_facts"
+    save_topic = f"users/{username}/save_fact"
     search_results_topic = f"users/{username}/search_results"
     delete_results_topic = f"users/{username}/delete_results"
+    save_results_topic = f"users/{username}/save_fact_result"
 
     # Always republish topic declaration so agents that restarted can rediscover it
     await nexus.publish(
@@ -765,6 +794,19 @@ async def on_user_connected(topic: str, payload):
                     "access": "read",
                     "format": {"query": "string", "deleted_count": "int", "deleted": ["string"]},
                 },
+                {
+                    "topic": save_topic,
+                    "description": "Mémorise un fait personnel déclaré par l'utilisateur.",
+                    "access": "write",
+                    "response_topic": save_results_topic,
+                    "format": {"statement": "string"},
+                },
+                {
+                    "topic": save_results_topic,
+                    "description": "Confirmation de la mémorisation d'un fait.",
+                    "access": "read",
+                    "format": {"saved": "bool", "fact": {"type": "string", "value": "string"}},
+                },
             ],
             "intents": [
                 {
@@ -805,6 +847,24 @@ async def on_user_connected(topic: str, payload):
                     ],
                     "payload": {"query": "{query}"},
                     "write_topic": delete_topic,
+                },
+                {
+                    "name": "profiler.save",
+                    "description": "Mémorise une préférence, un goût ou un fait personnel déclaré par l'utilisateur",
+                    "examples": [
+                        "J'aime bien les restaurants japonais",
+                        "Je n'aime pas les films d'horreur",
+                        "Je joue au tennis le week-end",
+                        "J'habite à Paris",
+                        "Je suis ingénieur logiciel",
+                        "J'adore la musique jazz",
+                        "Je suis végétarien",
+                        "J'aime lire des romans de science-fiction",
+                        "Je préfère les voitures électriques",
+                        "Mon équipe de foot préférée c'est l'OM",
+                    ],
+                    "payload": {"statement": "{statement}"},
+                    "write_topic": save_topic,
                 },
             ],
         }],
@@ -981,11 +1041,39 @@ async def on_user_connected(topic: str, payload):
         )
         logger.info(f"[{username}] Résultat suppression publié: {len(deleted_labels)} faits supprimés")
 
+    async def on_save_request(t, p):
+        if not isinstance(p, dict):
+            return
+        statement = p.get("statement", "").strip()
+        if not statement:
+            return
+        logger.info(f"[{username}] Mémorisation: {statement!r}")
+        loop = asyncio.get_event_loop()
+        known_types = await _fetch_known_types(username, auth_headers)
+        fact = await loop.run_in_executor(None, _extract_fact_for_save_sync, statement, known_types or DEFAULT_FACT_TYPES)
+        if not fact or not fact.get("type") or not fact.get("value"):
+            logger.warning(f"[{username}] Extraction du fait échouée pour: {statement!r}")
+            await nexus.publish(save_results_topic, {"saved": False, "fact": {}})
+            return
+        try:
+            async with aiohttp.ClientSession(headers=auth_headers) as http:
+                resp = await http.post(
+                    f"{MNEMONIC_URL}/users/{username}/facts",
+                    json={"facts": [{"type": fact["type"], "value": fact["value"]}]},
+                )
+                resp.raise_for_status()
+            logger.info(f"[{username}] Fait mémorisé: {fact}")
+            await nexus.publish(save_results_topic, {"saved": True, "fact": fact})
+        except Exception as e:
+            logger.error(f"[{username}] Échec mémorisation: {e}")
+            await nexus.publish(save_results_topic, {"saved": False, "fact": fact})
+
     nexus.subscribe(discussions_topic, handler)
     nexus.subscribe(search_topic, on_search_request)
     nexus.subscribe(delete_topic, on_delete_request)
+    nexus.subscribe(save_topic, on_save_request)
     nexus.start_listening()
-    logger.info(f"[{username}] Abonné aux discussions, search_preference, delete_facts")
+    logger.info(f"[{username}] Abonné aux discussions, search_preference, delete_facts, save_fact")
 
 
 async def main():

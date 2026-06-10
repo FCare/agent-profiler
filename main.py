@@ -29,6 +29,7 @@ HABIT_THRESHOLD = int(os.environ.get("HABIT_THRESHOLD", "5"))
 AGENT_NAME = "profiler"
 
 _subscribed_users: set[str] = set()
+_user_passwords: dict[str, str] = {}  # username → current session cookie (refreshed on each reconnect)
 
 DEFAULT_FACT_TYPES = [
     "name", "location", "occupation", "family", "language", "skill",
@@ -153,9 +154,9 @@ def _extract_facts_sync(messages: list, known_types: list[str]) -> list[dict]:
         return []
 
 
-async def _fetch_known_types(username: str, auth_headers: dict) -> list[str]:
+async def _fetch_known_types(username: str, {"Cookie": f"vk_session={_user_passwords[username]}"}: dict) -> list[str]:
     try:
-        async with aiohttp.ClientSession(headers=auth_headers) as http:
+        async with aiohttp.ClientSession(headers={"Cookie": f"vk_session={_user_passwords[username]}"}) as http:
             resp = await http.get(f"{MNEMONIC_URL}/users/{username}/facts/types")
             resp.raise_for_status()
             types = (await resp.json()).get("types", [])
@@ -209,10 +210,10 @@ def _find_habits_sync(facts: list[dict], known_types: list[str]) -> list[dict]:
         return []
 
 
-async def _consolidate_habits(username: str, auth_headers: dict):
+async def _consolidate_habits(username: str, {"Cookie": f"vk_session={_user_passwords[username]}"}: dict):
     logger.info(f"[{username}] Consolidation des habitudes en cours...")
     try:
-        async with aiohttp.ClientSession(headers=auth_headers) as http:
+        async with aiohttp.ClientSession(headers={"Cookie": f"vk_session={_user_passwords[username]}"}) as http:
             resp = await http.get(f"{MNEMONIC_URL}/users/{username}/facts")
             resp.raise_for_status()
             all_facts = await resp.json()
@@ -255,7 +256,7 @@ async def _consolidate_habits(username: str, auth_headers: dict):
         logger.info(f"[{username}] Stockage habitude: type={habit['type']} description=\"{habit['description']}\" sessions={session_ids}")
 
         try:
-            async with aiohttp.ClientSession(headers=auth_headers) as http:
+            async with aiohttp.ClientSession(headers={"Cookie": f"vk_session={_user_passwords[username]}"}) as http:
                 resp = await http.post(
                     f"{MNEMONIC_URL}/users/{username}/facts",
                     json={
@@ -581,10 +582,10 @@ def _synthesize_search_sync(query: str, facts: list[dict]) -> str:
         return ", ".join(f["value"] for f in facts)
 
 
-async def _generate_profile(username: str, auth_headers: dict, nexus, profile_topic: str):
+async def _generate_profile(username: str, {"Cookie": f"vk_session={_user_passwords[username]}"}: dict, nexus, profile_topic: str):
     logger.info(f"[{username}] Génération du profil...")
     try:
-        async with aiohttp.ClientSession(headers=auth_headers) as http:
+        async with aiohttp.ClientSession(headers={"Cookie": f"vk_session={_user_passwords[username]}"}) as http:
             resp = await http.get(f"{MNEMONIC_URL}/users/{username}/facts/types")
             resp.raise_for_status()
             available_types = (await resp.json()).get("types", [])
@@ -604,7 +605,7 @@ async def _generate_profile(username: str, auth_headers: dict, nexus, profile_to
     personal_facts = []
     habits = []
     try:
-        async with aiohttp.ClientSession(headers=auth_headers) as http:
+        async with aiohttp.ClientSession(headers={"Cookie": f"vk_session={_user_passwords[username]}"}) as http:
             for fact_type in profile_types:
                 resp = await http.get(f"{MNEMONIC_URL}/users/{username}/facts", params={"fact_type": fact_type})
                 resp.raise_for_status()
@@ -640,12 +641,12 @@ async def on_discussion(username: str, topic: str, payload, user_api_key: str, n
 
     logger.info(f"[{username}] Discussion reçue ({len(payload)} messages)")
 
-    auth_headers = {"Cookie": f"vk_session={user_api_key}"}
+    {"Cookie": f"vk_session={_user_passwords[username]}"} = {"Cookie": f"vk_session={user_api_key}"}
     sessions_url = f"{MNEMONIC_URL}/users/{username}/sessions"
     logger.info(f"[{username}] POST {sessions_url} — Cookie: vk_session={user_api_key}")
 
     try:
-        async with aiohttp.ClientSession(headers=auth_headers) as http:
+        async with aiohttp.ClientSession(headers={"Cookie": f"vk_session={_user_passwords[username]}"}) as http:
             resp = await http.post(
                 sessions_url,
                 json={"messages": payload},
@@ -657,7 +658,7 @@ async def on_discussion(username: str, topic: str, payload, user_api_key: str, n
         logger.error(f"[{username}] Échec stockage session dans mnemonic: {e}")
         return
 
-    known_types = await _fetch_known_types(username, auth_headers)
+    known_types = await _fetch_known_types(username, {"Cookie": f"vk_session={_user_passwords[username]}"})
     logger.info(f"[{username}] Types connus: {known_types}")
 
     logger.info(f"[{username}] Extraction des faits en cours...")
@@ -671,7 +672,7 @@ async def on_discussion(username: str, topic: str, payload, user_api_key: str, n
         logger.info(f"[{username}]   {fact['type']}: {fact['value']}")
 
     try:
-        async with aiohttp.ClientSession(headers=auth_headers) as http:
+        async with aiohttp.ClientSession(headers={"Cookie": f"vk_session={_user_passwords[username]}"}) as http:
             resp = await http.post(
                 f"{MNEMONIC_URL}/users/{username}/facts",
                 json={"facts": facts, "session_id": session_id},
@@ -682,8 +683,8 @@ async def on_discussion(username: str, topic: str, payload, user_api_key: str, n
         logger.error(f"[{username}] Échec enregistrement des faits dans mnemonic: {e}")
         return
 
-    await _consolidate_habits(username, auth_headers)
-    await _generate_profile(username, auth_headers, nexus, profile_topic)
+    await _consolidate_habits(username, {"Cookie": f"vk_session={_user_passwords[username]}"})
+    await _generate_profile(username, {"Cookie": f"vk_session={_user_passwords[username]}"}, nexus, profile_topic)
 
 
 async def on_user_connected(topic: str, payload):
@@ -770,6 +771,10 @@ async def on_user_connected(topic: str, payload):
     )
     logger.info(f"[{username}] Topics déclarés sur {agent_topics_topic}")
 
+    # Always refresh the password — cookie expires after 24h
+    _user_passwords[username] = password
+    logger.info(f"[{username}] Cookie de session mis à jour")
+
     if already_subscribed:
         logger.debug(f"[{username}] Déjà abonné aux discussions, skip souscription")
         return
@@ -777,10 +782,8 @@ async def on_user_connected(topic: str, payload):
     _subscribed_users.add(username)
     logger.info(f"Nouvel utilisateur: {username} — discussions={discussions_topic}")
 
-    auth_headers = {"Cookie": f"vk_session={password}"}
-
     async def handler(t, p):
-        await on_discussion(username, t, p, password, nexus, profile_topic)
+        await on_discussion(username, t, p, _user_passwords[username], nexus, profile_topic)
 
     async def on_search_request(t, p):
         if not isinstance(p, dict):
@@ -794,7 +797,7 @@ async def on_user_connected(topic: str, payload):
         loop = asyncio.get_event_loop()
 
         # 1. Fetch available types
-        available_types = await _fetch_known_types(username, auth_headers)
+        available_types = await _fetch_known_types(username, {"Cookie": f"vk_session={_user_passwords[username]}"})
         logger.info(f"[{username}] Types disponibles: {available_types}")
 
         # 2. LLM selects relevant types for this query
@@ -807,7 +810,7 @@ async def on_user_connected(topic: str, payload):
         facts = []
         if selected_types:
             try:
-                async with aiohttp.ClientSession(headers=auth_headers) as http:
+                async with aiohttp.ClientSession(headers={"Cookie": f"vk_session={_user_passwords[username]}"}) as http:
                     for fact_type in selected_types:
                         resp = await http.get(
                             f"{MNEMONIC_URL}/users/{username}/facts",
@@ -822,7 +825,7 @@ async def on_user_connected(topic: str, payload):
         if not facts:
             logger.info(f"[{username}] Fallback sur la recherche sémantique")
             try:
-                async with aiohttp.ClientSession(headers=auth_headers) as http:
+                async with aiohttp.ClientSession(headers={"Cookie": f"vk_session={_user_passwords[username]}"}) as http:
                     resp = await http.get(
                         f"{MNEMONIC_URL}/users/{username}/facts/search",
                         params={"q": query, "n": n},
@@ -852,7 +855,7 @@ async def on_user_connected(topic: str, payload):
 
         if ids:
             logger.info(f"[{username}] Suppression par ids: {ids}")
-            async with aiohttp.ClientSession(headers=auth_headers) as http:
+            async with aiohttp.ClientSession(headers={"Cookie": f"vk_session={_user_passwords[username]}"}) as http:
                 for fact_id in ids:
                     try:
                         resp = await http.delete(f"{MNEMONIC_URL}/users/{username}/facts/{fact_id}")
@@ -867,7 +870,7 @@ async def on_user_connected(topic: str, payload):
             loop = asyncio.get_event_loop()
 
             # 1. Find directly relevant types for this query (strict, max 2)
-            available_types = await _fetch_known_types(username, auth_headers)
+            available_types = await _fetch_known_types(username, {"Cookie": f"vk_session={_user_passwords[username]}"})
             selected_types = await loop.run_in_executor(
                 None, _select_deletion_types_sync, query, available_types
             )
@@ -877,7 +880,7 @@ async def on_user_connected(topic: str, payload):
             candidates = []
             if selected_types:
                 try:
-                    async with aiohttp.ClientSession(headers=auth_headers) as http:
+                    async with aiohttp.ClientSession(headers={"Cookie": f"vk_session={_user_passwords[username]}"}) as http:
                         for fact_type in selected_types:
                             resp = await http.get(
                                 f"{MNEMONIC_URL}/users/{username}/facts",
@@ -909,7 +912,7 @@ async def on_user_connected(topic: str, payload):
 
             # 4. Delete only the filtered facts, collecting associated session_ids
             session_ids_to_delete = set()
-            async with aiohttp.ClientSession(headers=auth_headers) as http:
+            async with aiohttp.ClientSession(headers={"Cookie": f"vk_session={_user_passwords[username]}"}) as http:
                 for fact_id in ids_to_delete:
                     try:
                         resp = await http.delete(f"{MNEMONIC_URL}/users/{username}/facts/{fact_id}")
@@ -925,7 +928,7 @@ async def on_user_connected(topic: str, payload):
 
             # 5. Delete associated sessions
             if session_ids_to_delete:
-                async with aiohttp.ClientSession(headers=auth_headers) as http:
+                async with aiohttp.ClientSession(headers={"Cookie": f"vk_session={_user_passwords[username]}"}) as http:
                     for session_id in session_ids_to_delete:
                         try:
                             resp = await http.delete(f"{MNEMONIC_URL}/users/{username}/sessions/{session_id}")

@@ -154,9 +154,9 @@ def _extract_facts_sync(messages: list, known_types: list[str]) -> list[dict]:
         return []
 
 
-async def _fetch_known_types(username: str, {"Cookie": f"vk_session={_user_passwords[username]}"}: dict) -> list[str]:
+async def _fetch_known_types(username: str, auth_headers: dict) -> list[str]:
     try:
-        async with aiohttp.ClientSession(headers={"Cookie": f"vk_session={_user_passwords[username]}"}) as http:
+        async with aiohttp.ClientSession(headers=auth_headers) as http:
             resp = await http.get(f"{MNEMONIC_URL}/users/{username}/facts/types")
             resp.raise_for_status()
             types = (await resp.json()).get("types", [])
@@ -210,10 +210,10 @@ def _find_habits_sync(facts: list[dict], known_types: list[str]) -> list[dict]:
         return []
 
 
-async def _consolidate_habits(username: str, {"Cookie": f"vk_session={_user_passwords[username]}"}: dict):
+async def _consolidate_habits(username: str, auth_headers: dict):
     logger.info(f"[{username}] Consolidation des habitudes en cours...")
     try:
-        async with aiohttp.ClientSession(headers={"Cookie": f"vk_session={_user_passwords[username]}"}) as http:
+        async with aiohttp.ClientSession(headers=auth_headers) as http:
             resp = await http.get(f"{MNEMONIC_URL}/users/{username}/facts")
             resp.raise_for_status()
             all_facts = await resp.json()
@@ -256,7 +256,7 @@ async def _consolidate_habits(username: str, {"Cookie": f"vk_session={_user_pass
         logger.info(f"[{username}] Stockage habitude: type={habit['type']} description=\"{habit['description']}\" sessions={session_ids}")
 
         try:
-            async with aiohttp.ClientSession(headers={"Cookie": f"vk_session={_user_passwords[username]}"}) as http:
+            async with aiohttp.ClientSession(headers=auth_headers) as http:
                 resp = await http.post(
                     f"{MNEMONIC_URL}/users/{username}/facts",
                     json={
@@ -582,10 +582,10 @@ def _synthesize_search_sync(query: str, facts: list[dict]) -> str:
         return ", ".join(f["value"] for f in facts)
 
 
-async def _generate_profile(username: str, {"Cookie": f"vk_session={_user_passwords[username]}"}: dict, nexus, profile_topic: str):
+async def _generate_profile(username: str, auth_headers: dict, nexus, profile_topic: str):
     logger.info(f"[{username}] Génération du profil...")
     try:
-        async with aiohttp.ClientSession(headers={"Cookie": f"vk_session={_user_passwords[username]}"}) as http:
+        async with aiohttp.ClientSession(headers=auth_headers) as http:
             resp = await http.get(f"{MNEMONIC_URL}/users/{username}/facts/types")
             resp.raise_for_status()
             available_types = (await resp.json()).get("types", [])
@@ -605,7 +605,7 @@ async def _generate_profile(username: str, {"Cookie": f"vk_session={_user_passwo
     personal_facts = []
     habits = []
     try:
-        async with aiohttp.ClientSession(headers={"Cookie": f"vk_session={_user_passwords[username]}"}) as http:
+        async with aiohttp.ClientSession(headers=auth_headers) as http:
             for fact_type in profile_types:
                 resp = await http.get(f"{MNEMONIC_URL}/users/{username}/facts", params={"fact_type": fact_type})
                 resp.raise_for_status()
@@ -641,12 +641,12 @@ async def on_discussion(username: str, topic: str, payload, user_api_key: str, n
 
     logger.info(f"[{username}] Discussion reçue ({len(payload)} messages)")
 
-    {"Cookie": f"vk_session={_user_passwords[username]}"} = {"Cookie": f"vk_session={user_api_key}"}
+    auth_headers = {"Cookie": f"vk_session={user_api_key}"}
     sessions_url = f"{MNEMONIC_URL}/users/{username}/sessions"
     logger.info(f"[{username}] POST {sessions_url} — Cookie: vk_session={user_api_key}")
 
     try:
-        async with aiohttp.ClientSession(headers={"Cookie": f"vk_session={_user_passwords[username]}"}) as http:
+        async with aiohttp.ClientSession(headers=auth_headers) as http:
             resp = await http.post(
                 sessions_url,
                 json={"messages": payload},
@@ -658,7 +658,7 @@ async def on_discussion(username: str, topic: str, payload, user_api_key: str, n
         logger.error(f"[{username}] Échec stockage session dans mnemonic: {e}")
         return
 
-    known_types = await _fetch_known_types(username, {"Cookie": f"vk_session={_user_passwords[username]}"})
+    known_types = await _fetch_known_types(username, auth_headers)
     logger.info(f"[{username}] Types connus: {known_types}")
 
     logger.info(f"[{username}] Extraction des faits en cours...")
@@ -672,7 +672,7 @@ async def on_discussion(username: str, topic: str, payload, user_api_key: str, n
         logger.info(f"[{username}]   {fact['type']}: {fact['value']}")
 
     try:
-        async with aiohttp.ClientSession(headers={"Cookie": f"vk_session={_user_passwords[username]}"}) as http:
+        async with aiohttp.ClientSession(headers=auth_headers) as http:
             resp = await http.post(
                 f"{MNEMONIC_URL}/users/{username}/facts",
                 json={"facts": facts, "session_id": session_id},
@@ -683,8 +683,8 @@ async def on_discussion(username: str, topic: str, payload, user_api_key: str, n
         logger.error(f"[{username}] Échec enregistrement des faits dans mnemonic: {e}")
         return
 
-    await _consolidate_habits(username, {"Cookie": f"vk_session={_user_passwords[username]}"})
-    await _generate_profile(username, {"Cookie": f"vk_session={_user_passwords[username]}"}, nexus, profile_topic)
+    await _consolidate_habits(username, auth_headers)
+    await _generate_profile(username, auth_headers, nexus, profile_topic)
 
 
 async def on_user_connected(topic: str, payload):

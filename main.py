@@ -441,37 +441,16 @@ def _select_deletion_types_sync(query: str, available_types: list[str]) -> list[
 def _build_profile_sync(username: str, personal_facts: list[dict], habits: list[dict]) -> str:
     lines = []
     if personal_facts:
-        lines.append("Personal facts:")
+        lines.append("Known facts:")
         for f in personal_facts:
-            lines.append(f"  [{f['type']}] {f['value']}")
+            lines.append(f"- {f['value']}")
     if habits:
-        lines.append("Habits and recurring interests:")
+        lines.append("Recurring interests/habits:")
         for h in habits:
-            lines.append(f"  [{h['type']}] {h['value']}")
-    context = "\n".join(lines)
-    logger.info(f"[{username}] Contexte profil envoyé au LLM:\n{context}")
-    try:
-        client = openai.OpenAI(api_key=LLAMACPP_API_KEY, base_url=LLM_BASE_URL)
-        resp = client.chat.completions.create(
-            model=LLM_MODEL,
-            messages=[
-                {"role": "system", "content": (
-                    "Generate a concise personal profile of the user strictly from the provided facts and habits. "
-                    "Write in third person, in English. "
-                    "STRICT RULES: "
-                    "(1) Only state what is explicitly in the facts — never infer, guess, or add context. "
-                    "(2) Do not add geographic, cultural, or demographic details not present in the facts. "
-                    "(3) An interest in weather for a location does NOT mean the user lives there — do not write 'resides in' or 'lives in' unless a fact explicitly states it. "
-                    "(4) Never use words like 'likely', 'probably', 'apparently', 'seems to'. "
-                    "Describe only what is known. 1-4 sentences."
-                )},
-                {"role": "user", "content": f"User: {username}\n\n{context}"},
-            ],
-        )
-        return resp.choices[0].message.content.strip()
-    except Exception as e:
-        logger.error(f"[{username}] Génération du texte de profil échouée: {e}")
-        return ""
+            lines.append(f"- {h['value']}")
+    profile = "\n".join(lines)
+    logger.info(f"[{username}] Profil construit:\n{profile}")
+    return profile
 
 
 def _filter_facts_for_deletion_sync(query: str, facts: list[dict]) -> list[str]:

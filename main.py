@@ -28,8 +28,10 @@ HABIT_THRESHOLD = int(os.environ.get("HABIT_THRESHOLD", "5"))
 
 AGENT_NAME = "profiler"
 
-_subscribed_users: set[str] = set()
+_subscribed_users: set[str] = set()   # per-user: discussions subscription
+_subscribed_sessions: set[str] = set()  # per-session: search/delete subscriptions
 _user_passwords: dict[str, str] = {}  # username → current session cookie (refreshed on each reconnect)
+_user_nexus: dict[str, object] = {}   # username → shared nexus for per-user subscriptions
 
 DEFAULT_FACT_TYPES = [
     "name", "location", "occupation", "family", "language", "skill",
@@ -672,9 +674,10 @@ async def on_user_connected(topic: str, payload):
 
     username = payload.get("username")
     password = payload.get("password")
+    session_id = payload.get("session_id")
     private_topics = payload.get("private_topics", [])
 
-    if not username or not password:
+    if not username or not password or not session_id:
         return
 
     discussions_topic = _find_topic(private_topics, "discussions")
@@ -684,15 +687,19 @@ async def on_user_connected(topic: str, payload):
         logger.warning(f"Topics manquants pour {username}, skip")
         return
 
-    already_subscribed = username in _subscribed_users
-
+    # Per-user: profile and discussions stay per-user
     profile_topic = f"users/{username}/profile"
-    nexus = NexusClient.from_api_key(VK_URL, MQTT_HOST, SERVICE_USERNAME, SERVICE_API_KEY, MQTT_PORT)
 
-    search_topic = f"users/{username}/search_preference"
-    delete_topic = f"users/{username}/delete_facts"
-    search_results_topic = f"users/{username}/search_results"
-    delete_results_topic = f"users/{username}/delete_results"
+    # Per-session: search/delete topics scoped to this connection
+    search_topic = f"users/{username}/{session_id}/search_preference"
+    delete_topic = f"users/{username}/{session_id}/delete_facts"
+    search_results_topic = f"users/{username}/{session_id}/search_results"
+    delete_results_topic = f"users/{username}/{session_id}/delete_results"
+
+    # Reuse per-user nexus for discussions (avoid duplicate subscriptions across sessions)
+    if username not in _user_nexus:
+        _user_nexus[username] = NexusClient.from_api_key(VK_URL, MQTT_HOST, SERVICE_USERNAME, SERVICE_API_KEY, MQTT_PORT)
+    nexus = _user_nexus[username]
 
     # Always republish topic declaration so agents that restarted can rediscover it
     await nexus.publish(
@@ -748,21 +755,30 @@ async def on_user_connected(topic: str, payload):
             ],
         }],
     )
-    logger.info(f"[{username}] Topics déclarés sur {agent_topics_topic}")
+    logger.info(f"[{username}/{session_id}] Topics déclarés sur {agent_topics_topic}")
 
     # Always refresh the password — cookie expires after 24h
     _user_passwords[username] = password
     logger.info(f"[{username}] Cookie de session mis à jour")
 
-    if already_subscribed:
-        logger.debug(f"[{username}] Déjà abonné aux discussions, skip souscription")
+    # Per-user: subscribe to discussions only once
+    if username not in _subscribed_users:
+        _subscribed_users.add(username)
+        logger.info(f"Nouvel utilisateur: {username} — discussions={discussions_topic}")
+
+        async def handler(t, p):
+            await on_discussion(username, t, p, _user_passwords[username], nexus, profile_topic)
+
+        nexus.subscribe(discussions_topic, handler)
+
+    # Per-session: subscribe to search/delete
+    if session_id in _subscribed_sessions:
+        nexus.start_listening()
+        logger.debug(f"[{username}/{session_id}] Session déjà abonnée, skip search/delete")
         return
 
-    _subscribed_users.add(username)
-    logger.info(f"Nouvel utilisateur: {username} — discussions={discussions_topic}")
-
-    async def handler(t, p):
-        await on_discussion(username, t, p, _user_passwords[username], nexus, profile_topic)
+    _subscribed_sessions.add(session_id)
+    logger.info(f"[{username}/{session_id}] Nouvelle session — abonnement search/delete")
 
     async def on_search_request(t, p):
         if not isinstance(p, dict):
@@ -908,13 +924,13 @@ async def on_user_connected(topic: str, payload):
             # 5. Delete associated sessions
             if session_ids_to_delete:
                 async with aiohttp.ClientSession(headers={"Cookie": f"vk_session={_user_passwords[username]}"}) as http:
-                    for session_id in session_ids_to_delete:
+                    for mnemonic_sid in session_ids_to_delete:
                         try:
-                            resp = await http.delete(f"{MNEMONIC_URL}/users/{username}/sessions/{session_id}")
+                            resp = await http.delete(f"{MNEMONIC_URL}/users/{username}/sessions/{mnemonic_sid}")
                             resp.raise_for_status()
-                            logger.info(f"[{username}] Session supprimée: {session_id}")
+                            logger.info(f"[{username}] Session supprimée: {mnemonic_sid}")
                         except Exception as e:
-                            logger.error(f"[{username}] Échec suppression session {session_id}: {e}")
+                            logger.error(f"[{username}] Échec suppression session {mnemonic_sid}: {e}")
 
         await nexus.publish(
             delete_results_topic,
@@ -922,11 +938,10 @@ async def on_user_connected(topic: str, payload):
         )
         logger.info(f"[{username}] Résultat suppression publié: {len(deleted_labels)} faits supprimés")
 
-    nexus.subscribe(discussions_topic, handler)
     nexus.subscribe(search_topic, on_search_request)
     nexus.subscribe(delete_topic, on_delete_request)
     nexus.start_listening()
-    logger.info(f"[{username}] Abonné aux discussions, search_preference, delete_facts")
+    logger.info(f"[{username}/{session_id}] Abonné à search_preference, delete_facts")
 
 
 async def main():

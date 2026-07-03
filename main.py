@@ -27,11 +27,16 @@ LLAMACPP_API_KEY = os.environ["LLAMACPP_API_KEY"]
 HABIT_THRESHOLD = int(os.environ.get("HABIT_THRESHOLD", "5"))
 
 AGENT_NAME = "profiler"
+HABIT_TTL_DAYS = int(os.environ.get("HABIT_TTL_DAYS", "30"))
+HABIT_MATCH_THRESHOLD = float(os.environ.get("HABIT_MATCH_THRESHOLD", "0.35"))
+# These fact types never expire — they describe who the person IS, not what they do
+PERMANENT_TYPES = {"name", "occupation", "family", "language", "location", "personality", "goal", "skill"}
 
 _subscribed_users: set[str] = set()   # per-user: discussions subscription
 _subscribed_sessions: set[str] = set()  # per-session: search/delete subscriptions
 _user_passwords: dict[str, str] = {}  # username → current session cookie (refreshed on each reconnect)
 _user_nexus: dict[str, object] = {}   # username → shared nexus for per-user subscriptions
+_profile_tasks: dict[str, asyncio.Task] = {}  # username → pending debounced profile task
 
 DEFAULT_FACT_TYPES = [
     "name", "location", "occupation", "family", "language", "skill",
@@ -120,6 +125,8 @@ EXTRACT_SYSTEM_PROMPT = (
     "Extract facts ONLY from [user] lines. Use [assistant] lines as context to better understand and categorize user messages. "
     "Every [user] line reveals at least one fact: questions reveal interests, requests reveal needs, statements reveal preferences. "
     "Values must be complete English statements, never French. "
+    "IGNORE completely: any user message asking to forget, delete, erase or clear memories/facts/data. "
+    "These are instructions to the system, not personal facts to record. Do NOT extract them. "
     "Examples:\n"
     "- [user]: je m'appelle François → {type: \"name\", value: \"is named François\"}\n"
     "- [user]: mon prénom c'est Marie → {type: \"name\", value: \"is named Marie\"}\n"
@@ -127,6 +134,8 @@ EXTRACT_SYSTEM_PROMPT = (
     "- [user]: j aime le retro gaming → {type: \"video_game\", value: \"likes retro gaming\"}\n"
     "- [user]: tu connais le cycle de Hain? / [assistant]: c'est une série SF / [user]: c'est plusieurs livres → {type: \"book\", value: \"is interested in the Hain cycle\"}\n"
     "- [user]: j'aime le space opera → {type: \"book\", value: \"enjoys space opera as a genre\"}\n"
+    "- [user]: oublie tout sur moi → (nothing to extract, this is a deletion command)\n"
+    "- [user]: efface mes données → (nothing to extract, this is a deletion command)\n"
     "Call extract_user_facts with ALL facts found."
 )
 
@@ -212,6 +221,47 @@ def _find_habits_sync(facts: list[dict], known_types: list[str]) -> list[dict]:
         return []
 
 
+def _habit_expires_at() -> str:
+    from datetime import timedelta
+    return (datetime.now(timezone.utc) + timedelta(days=HABIT_TTL_DAYS)).isoformat()
+
+
+async def _match_facts_to_habits(username: str, facts: list[dict], auth_headers: dict) -> tuple[list[dict], list[dict]]:
+    """Split facts into (unmatched → store as new facts, matched → refresh existing habit).
+    Returns (facts_to_store, []) — habit refreshes are done in-place."""
+    if not facts:
+        return facts, []
+    try:
+        async with aiohttp.ClientSession(headers=auth_headers) as http:
+            facts_to_store = []
+            for fact in facts:
+                resp = await http.get(
+                    f"{MNEMONIC_URL}/users/{username}/habits/search",
+                    params={"q": fact["value"], "n": 1, "threshold": HABIT_MATCH_THRESHOLD},
+                )
+                resp.raise_for_status()
+                matches = await resp.json()
+                if matches:
+                    habit = matches[0]
+                    fact_type = fact.get("type", "")
+                    if fact_type in PERMANENT_TYPES:
+                        # Permanent types: never expire, no refresh needed
+                        logger.info(f"[{username}] Fait permanent ignoré (correspond à habitude {habit['id']}): {fact['value']!r}")
+                    else:
+                        new_expires = _habit_expires_at()
+                        await http.patch(
+                            f"{MNEMONIC_URL}/users/{username}/habits/{habit['id']}",
+                            params={"expires_at": new_expires},
+                        )
+                        logger.info(f"[{username}] Habitude {habit['id']!r} rafraîchie ({fact['value']!r} ≈ {habit['value']!r}, distance={habit['distance']:.3f})")
+                else:
+                    facts_to_store.append(fact)
+            return facts_to_store, []
+    except Exception as e:
+        logger.error(f"[{username}] Matching habitudes échoué: {e}")
+        return facts, []
+
+
 async def _consolidate_habits(username: str, auth_headers: dict):
     logger.info(f"[{username}] Consolidation des habitudes en cours...")
     try:
@@ -223,14 +273,15 @@ async def _consolidate_habits(username: str, auth_headers: dict):
         logger.error(f"[{username}] Échec récupération faits pour consolidation: {e}")
         return
 
-    logger.info(f"[{username}] {len(all_facts)} faits récupérés (seuil: {HABIT_THRESHOLD})")
+    # Only consolidate non-permanent types — permanent ones are kept as individual facts
+    non_permanent_facts = [f for f in all_facts if f["type"] not in PERMANENT_TYPES]
+    logger.info(f"[{username}] {len(non_permanent_facts)}/{len(all_facts)} faits non-permanents (seuil: {HABIT_THRESHOLD})")
 
     type_counts = {}
-    for f in all_facts:
+    for f in non_permanent_facts:
         type_counts[f["type"]] = type_counts.get(f["type"], 0) + 1
-    logger.info(f"[{username}] Répartition par type: {type_counts}")
 
-    candidate_facts = [f for f in all_facts if type_counts[f["type"]] >= HABIT_THRESHOLD]
+    candidate_facts = [f for f in non_permanent_facts if type_counts[f["type"]] >= HABIT_THRESHOLD]
     if not candidate_facts:
         logger.info(f"[{username}] Aucun type avec ≥{HABIT_THRESHOLD} faits, pas de consolidation")
         return
@@ -254,22 +305,27 @@ async def _consolidate_habits(username: str, auth_headers: dict):
             logger.info(f"[{username}] Ignoré — moins de {HABIT_THRESHOLD} faits valides")
             continue
 
+        habit_type = habit["type"]
+        is_permanent = habit_type in PERMANENT_TYPES
+        expires_at = "" if is_permanent else _habit_expires_at()
+
         session_ids = list(dict.fromkeys(facts_by_id[fid]["session_id"] for fid in valid_ids))
-        logger.info(f"[{username}] Stockage habitude: type={habit['type']} description=\"{habit['description']}\" sessions={session_ids}")
+        logger.info(f"[{username}] Stockage habitude: type={habit_type} permanent={is_permanent} description=\"{habit['description']}\"")
 
         try:
             async with aiohttp.ClientSession(headers=auth_headers) as http:
                 resp = await http.post(
                     f"{MNEMONIC_URL}/users/{username}/facts",
                     json={
-                        "facts": [{"type": habit["type"], "value": habit["description"]}],
+                        "facts": [{"type": habit_type, "value": habit["description"]}],
                         "session_id": session_ids[0],
                         "session_ids": session_ids,
                         "is_habit": True,
+                        "expires_at": expires_at,
                     },
                 )
                 resp.raise_for_status()
-                logger.info(f"[{username}] Habitude stockée dans mnemonic")
+                logger.info(f"[{username}] Habitude stockée (expires: {expires_at or 'jamais'})")
 
                 for fid in valid_ids:
                     del_resp = await http.delete(f"{MNEMONIC_URL}/users/{username}/facts/{fid}")
@@ -616,6 +672,37 @@ async def _generate_profile(username: str, auth_headers: dict, nexus, profile_to
     logger.info(f"[{username}] Profil publié sur {profile_topic}")
 
 
+def _schedule_profile_generation(username: str, nexus, profile_topic: str):
+    existing = _profile_tasks.get(username)
+    if existing and not existing.done():
+        existing.cancel()
+        logger.debug(f"[{username}] Régénération profil annulée (debounce)")
+
+    async def _delayed():
+        await asyncio.sleep(0.5)
+        auth_headers = {"Cookie": f"vk_session={_user_passwords[username]}"}
+        await _generate_profile(username, auth_headers, nexus, profile_topic)
+
+    _profile_tasks[username] = asyncio.create_task(_delayed())
+    logger.info(f"[{username}] Régénération profil planifiée (debounce 500ms)")
+
+
+def _normalize_messages(payload: list) -> list:
+    """Convert multimodal messages to text-only for mnemonic storage."""
+    normalized = []
+    for msg in payload:
+        if not isinstance(msg, dict):
+            continue
+        content = msg.get("content", "")
+        if isinstance(content, list):
+            parts = [p.get("text", "") for p in content if isinstance(p, dict) and p.get("type") == "text"]
+            content = " ".join(parts).strip()
+        if not isinstance(content, str):
+            content = str(content)
+        normalized.append({"role": msg.get("role", "user"), "content": content})
+    return normalized
+
+
 async def on_discussion(username: str, topic: str, payload, user_api_key: str, nexus, profile_topic: str):
     if not isinstance(payload, list) or not payload:
         return
@@ -626,11 +713,16 @@ async def on_discussion(username: str, topic: str, payload, user_api_key: str, n
     sessions_url = f"{MNEMONIC_URL}/users/{username}/sessions"
     logger.info(f"[{username}] POST {sessions_url} — Cookie: vk_session={user_api_key}")
 
+    normalized = _normalize_messages(payload)
+    if not normalized:
+        logger.info(f"[{username}] Aucun message texte après normalisation, skip")
+        return
+
     try:
         async with aiohttp.ClientSession(headers=auth_headers) as http:
             resp = await http.post(
                 sessions_url,
-                json={"messages": payload},
+                json={"messages": normalized},
             )
             resp.raise_for_status()
             session_id = (await resp.json())["session_id"]
@@ -643,7 +735,7 @@ async def on_discussion(username: str, topic: str, payload, user_api_key: str, n
     logger.info(f"[{username}] Types connus: {known_types}")
 
     logger.info(f"[{username}] Extraction des faits en cours...")
-    facts = await _extract_facts(payload, known_types)
+    facts = await _extract_facts(normalized, known_types)
     if not facts:
         logger.info(f"[{username}] Aucun fait extrait")
         return
@@ -652,20 +744,25 @@ async def on_discussion(username: str, topic: str, payload, user_api_key: str, n
     for fact in facts:
         logger.info(f"[{username}]   {fact['type']}: {fact['value']}")
 
-    try:
-        async with aiohttp.ClientSession(headers=auth_headers) as http:
-            resp = await http.post(
-                f"{MNEMONIC_URL}/users/{username}/facts",
-                json={"facts": facts, "session_id": session_id},
-            )
-            resp.raise_for_status()
-        logger.info(f"[{username}] Faits enregistrés dans mnemonic")
-    except Exception as e:
-        logger.error(f"[{username}] Échec enregistrement des faits dans mnemonic: {e}")
-        return
+    # Filter out facts that already match an existing habit (refresh the habit instead)
+    facts_to_store, _ = await _match_facts_to_habits(username, facts, auth_headers)
+    logger.info(f"[{username}] {len(facts_to_store)}/{len(facts)} faits à stocker (autres = habitudes rafraîchies)")
+
+    if facts_to_store:
+        try:
+            async with aiohttp.ClientSession(headers=auth_headers) as http:
+                resp = await http.post(
+                    f"{MNEMONIC_URL}/users/{username}/facts",
+                    json={"facts": facts_to_store, "session_id": session_id},
+                )
+                resp.raise_for_status()
+            logger.info(f"[{username}] Faits enregistrés dans mnemonic")
+        except Exception as e:
+            logger.error(f"[{username}] Échec enregistrement des faits dans mnemonic: {e}")
+            return
 
     await _consolidate_habits(username, auth_headers)
-    await _generate_profile(username, auth_headers, nexus, profile_topic)
+    _schedule_profile_generation(username, nexus, profile_topic)
 
 
 async def on_user_connected(topic: str, payload):
@@ -701,7 +798,8 @@ async def on_user_connected(topic: str, payload):
         _user_nexus[username] = NexusClient.from_api_key(VK_URL, MQTT_HOST, SERVICE_USERNAME, SERVICE_API_KEY, MQTT_PORT)
     nexus = _user_nexus[username]
 
-    # Always republish topic declaration so agents that restarted can rediscover it
+    # Always republish topic declaration so agents that restarted can rediscover it.
+    # retain=True ensures late-subscribing backends (e.g. after restart) still receive it.
     await nexus.publish(
         agent_topics_topic,
         [{
@@ -734,11 +832,13 @@ async def on_user_connected(topic: str, payload):
                         "OU (2) déclare clairement qu'il ne s'intéresse plus à quelque chose "
                         "(ex: 'la météo ne m'intéresse plus', 'je n'aime plus le retro gaming'). "
                         "NE PAS utiliser si c'est un commentaire passager dans une demande d'action "
-                        "(ex: 'donne-moi la météo' ne doit PAS déclencher une suppression)."
+                        "(ex: 'donne-moi la météo' ne doit PAS déclencher une suppression). "
+                        "Pour effacer TOUTE la mémoire (ex: 'oublie tout', 'efface tout ce que tu sais sur moi'), "
+                        "utiliser clear_all=true."
                     ),
                     "access": "write",
                     "response_topic": delete_results_topic,
-                    "format": {"query": "string (OR) ids: [\"...\"]"},
+                    "format": {"query": "string (OR) ids: [\"...\"] (OR) clear_all: true"},
                 },
                 {
                     "topic": search_results_topic,
@@ -754,6 +854,7 @@ async def on_user_connected(topic: str, payload):
                 },
             ],
         }],
+        retain=True,
     )
     logger.info(f"[{username}/{session_id}] Topics déclarés sur {agent_topics_topic}")
 
@@ -783,6 +884,8 @@ async def on_user_connected(topic: str, payload):
     async def on_search_request(t, p):
         if not isinstance(p, dict):
             return
+        # Normalize keys: Gemma4 sometimes generates escaped quotes around key names
+        p = {k.strip('"'): v for k, v in p.items()}
         query = p.get("query", "")
         n = int(p.get("n", 5))
         if not query:
@@ -841,14 +944,28 @@ async def on_user_connected(topic: str, payload):
     async def on_delete_request(t, p):
         if not isinstance(p, dict):
             return
+        p = {k.strip('"'): v for k, v in p.items()}
         ids = p.get("ids")
         query = p.get("query", "")
-        if not ids and not query:
+        clear_all = p.get("clear_all", False)
+        if not ids and not query and not clear_all:
             return
 
         deleted_labels = []
 
-        if ids:
+        if clear_all:
+            logger.info(f"[{username}] Suppression totale de la mémoire")
+            try:
+                async with aiohttp.ClientSession(headers={"Cookie": f"vk_session={_user_passwords[username]}"}) as http:
+                    resp = await http.delete(f"{MNEMONIC_URL}/users/{username}/facts")
+                    resp.raise_for_status()
+                    result = await resp.json()
+                    n = result.get("deleted_count", 0)
+                    deleted_labels = [f"all ({n} facts)"]
+                    logger.info(f"[{username}] Mémoire effacée: {n} faits supprimés")
+            except Exception as e:
+                logger.error(f"[{username}] Échec suppression totale: {e}")
+        elif ids:
             logger.info(f"[{username}] Suppression par ids: {ids}")
             async with aiohttp.ClientSession(headers={"Cookie": f"vk_session={_user_passwords[username]}"}) as http:
                 for fact_id in ids:

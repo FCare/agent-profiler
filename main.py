@@ -37,6 +37,7 @@ _subscribed_sessions: set[str] = set()  # per-session: search/delete subscriptio
 _user_passwords: dict[str, str] = {}  # username → current session cookie (refreshed on each reconnect)
 _user_nexus: dict[str, object] = {}   # username → shared nexus for per-user subscriptions
 _profile_tasks: dict[str, asyncio.Task] = {}  # username → pending debounced profile task
+_consolidation_tasks: dict[str, asyncio.Task] = {}  # username → pending debounced consolidation task
 
 DEFAULT_FACT_TYPES = [
     "name", "location", "occupation", "family", "language", "skill",
@@ -334,6 +335,26 @@ async def _consolidate_habits(username: str, auth_headers: dict):
             logger.info(f"[{username}] Consolidation terminée: {len(valid_ids)} faits → 1 habitude")
         except Exception as e:
             logger.error(f"[{username}] Échec consolidation habitude: {e}")
+
+
+def _schedule_consolidation(username: str):
+    """Debounce _consolidate_habits comme _schedule_profile_generation le fait déjà pour
+    le profil : sans ça, chaque discussion déclenchait sa propre passe de consolidation
+    complète (re-scan de TOUS les faits + un appel LLM sur l'ensemble), et une rafale de
+    discussions (ex: plusieurs sessions de test rapprochées) empilait des passes redondantes
+    et de plus en plus coûteuses au lieu d'une seule consolidation sur l'état final."""
+    existing = _consolidation_tasks.get(username)
+    if existing and not existing.done():
+        existing.cancel()
+        logger.debug(f"[{username}] Consolidation annulée (debounce)")
+
+    async def _delayed():
+        await asyncio.sleep(2.0)
+        auth_headers = {"Cookie": f"vk_session={_user_passwords[username]}"}
+        await _consolidate_habits(username, auth_headers)
+
+    _consolidation_tasks[username] = asyncio.create_task(_delayed())
+    logger.info(f"[{username}] Consolidation planifiée (debounce 2s)")
 
 
 SELECT_TYPES_TOOL = [{
@@ -761,7 +782,7 @@ async def on_discussion(username: str, topic: str, payload, user_api_key: str, n
             logger.error(f"[{username}] Échec enregistrement des faits dans mnemonic: {e}")
             return
 
-    await _consolidate_habits(username, auth_headers)
+    _schedule_consolidation(username)
     _schedule_profile_generation(username, nexus, profile_topic)
 
 

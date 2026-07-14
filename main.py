@@ -25,12 +25,18 @@ LLM_BASE_URL = os.environ.get("LLM_BASE_URL", "https://thebrain.caronboulme.fr/v
 LLM_MODEL = os.environ.get("LLM_MODEL", "qwen3-vl-8b-instruct")
 LLAMACPP_API_KEY = os.environ["LLAMACPP_API_KEY"]
 HABIT_THRESHOLD = int(os.environ.get("HABIT_THRESHOLD", "5"))
+# Un seul appel LLM sur tout le backlog de faits candidats (ex: 241 faits observés en
+# pratique) génère un prompt énorme, lent (8-9 minutes mesurées) et sujet à des sorties
+# dégénérées (le modèle boucle en répétant les mêmes IDs jusqu'à la limite de tokens, ou
+# omet des champs requis). Regrouper par lots plus petits garde chaque appel rapide et
+# fiable, tout en restant assez large pour dépasser HABIT_THRESHOLD au sein d'un même lot.
+CONSOLIDATION_BATCH_SIZE = int(os.environ.get("CONSOLIDATION_BATCH_SIZE", "40"))
 
 AGENT_NAME = "profiler"
 HABIT_TTL_DAYS = int(os.environ.get("HABIT_TTL_DAYS", "30"))
 HABIT_MATCH_THRESHOLD = float(os.environ.get("HABIT_MATCH_THRESHOLD", "0.35"))
 # These fact types never expire — they describe who the person IS, not what they do
-PERMANENT_TYPES = {"name", "occupation", "family", "language", "location", "personality", "goal", "skill"}
+PERMANENT_TYPES = {"personal"}
 
 _subscribed_users: set[str] = set()   # per-user: discussions subscription
 _subscribed_sessions: set[str] = set()  # per-session: search/delete subscriptions
@@ -38,21 +44,37 @@ _user_passwords: dict[str, str] = {}  # username → current session cookie (ref
 _user_nexus: dict[str, object] = {}   # username → shared nexus for per-user subscriptions
 _profile_tasks: dict[str, asyncio.Task] = {}  # username → pending debounced profile task
 _consolidation_tasks: dict[str, asyncio.Task] = {}  # username → pending debounced consolidation task
+_consolidation_running: dict[str, bool] = {}  # username → True once past the debounce delay, actively executing
 
-DEFAULT_FACT_TYPES = [
-    "name", "location", "occupation", "family", "language", "skill",
-    "cuisine", "music", "sport", "video_game", "technology", "politics",
-    "cinema", "book", "travel", "art", "fashion", "nature", "science",
-    "philosophy", "humor", "habit", "goal", "personality",
-]
+# Taxonomie fermée : le champ 'type' d'un fait est contraint à ces 5 valeurs (voir
+# _type_field_schema) et le LLM n'a JAMAIS la possibilité d'en inventer une nouvelle. Avant
+# ce verrou, le champ était du texte libre avec une simple préférence pour réutiliser un type
+# existant — sous température non nulle, le modèle dérivait vers des quasi-synonymes
+# (interest / general_interest / literature_interest / book_interest...), fragmentant les
+# mêmes faits sur des dizaines de types différents. Résultat concret : la sélection de type à
+# la recherche devenait impossible à deviner de façon fiable, et la consolidation ne
+# regroupait jamais assez de faits similaires pour dépasser HABIT_THRESHOLD.
+DEFAULT_FACT_TYPES = ["assistant", "personal", "media", "interest", "places"]
 
 
 def _type_field_schema(known_types: list[str]) -> dict:
+    # known_types est ignoré à dessein : la taxonomie est fermée (voir DEFAULT_FACT_TYPES),
+    # le paramètre reste pour ne pas toucher les appelants.
     return {
         "type": "string",
+        "enum": DEFAULT_FACT_TYPES,
         "description": (
-            f"Fact category. Prefer one of the known types if it fits: {', '.join(known_types)}. "
-            "Otherwise invent a concise English noun (e.g. 'sport', 'cinema')."
+            "Fact category — always exactly one of these five, never invent a new one: "
+            "'assistant' (how the user wants to interact with the assistant itself — tone, "
+            "verbosity, jokes, language of the answers); "
+            "'personal' (identity facts — name, family, friends, AND the user's OWN home "
+            "address/city/place of residence); "
+            "'media' (music listened to, contes/stories read or heard); "
+            "'interest' (any other personal interest — news, food, video games, books other "
+            "than contes, hobbies, sports...); "
+            "'places' (places OTHER than the user's own home that are often searched or "
+            "mentioned — restaurants, cities asked about for weather, addresses looked up, "
+            "travel destinations)."
         ),
     }
 
@@ -126,15 +148,24 @@ EXTRACT_SYSTEM_PROMPT = (
     "Extract facts ONLY from [user] lines. Use [assistant] lines as context to better understand and categorize user messages. "
     "Every [user] line reveals at least one fact: questions reveal interests, requests reveal needs, statements reveal preferences. "
     "Values must be complete English statements, never French. "
+    "Categorize EVERY fact into EXACTLY one of five fixed categories — NEVER invent a new one:\n"
+    "- assistant: how the user wants to interact with the assistant itself (tone, verbosity, jokes, language of the answers).\n"
+    "- personal: identity facts — name, family, friends, AND the user's OWN home address/city/place of residence.\n"
+    "- media: music listened to, contes/stories read or heard.\n"
+    "- interest: any other personal interest — news, food, video games, books other than contes, hobbies, sports...\n"
+    "- places: places OTHER than the user's own home that are often searched or mentioned — restaurants, cities asked about for weather, addresses looked up, travel destinations.\n"
     "IGNORE completely: any user message asking to forget, delete, erase or clear memories/facts/data. "
     "These are instructions to the system, not personal facts to record. Do NOT extract them. "
     "Examples:\n"
-    "- [user]: je m'appelle François → {type: \"name\", value: \"is named François\"}\n"
-    "- [user]: mon prénom c'est Marie → {type: \"name\", value: \"is named Marie\"}\n"
-    "- [user]: quelle meteo demain a paris → {type: \"location\", value: \"is interested in weather in Paris\"}\n"
-    "- [user]: j aime le retro gaming → {type: \"video_game\", value: \"likes retro gaming\"}\n"
-    "- [user]: tu connais le cycle de Hain? / [assistant]: c'est une série SF / [user]: c'est plusieurs livres → {type: \"book\", value: \"is interested in the Hain cycle\"}\n"
-    "- [user]: j'aime le space opera → {type: \"book\", value: \"enjoys space opera as a genre\"}\n"
+    "- [user]: je m'appelle François → {type: \"personal\", value: \"is named François\"}\n"
+    "- [user]: mon prénom c'est Marie → {type: \"personal\", value: \"is named Marie\"}\n"
+    "- [user]: j'habite à Lyon → {type: \"personal\", value: \"lives in Lyon\"} (this is the user's OWN residence, always 'personal', never 'places')\n"
+    "- [user]: quelle meteo demain a paris → {type: \"places\", value: \"asks about weather in Paris\"} (Paris here is NOT the user's home — a place they're merely asking about)\n"
+    "- [user]: j aime le retro gaming → {type: \"interest\", value: \"likes retro gaming\"}\n"
+    "- [user]: tu connais le cycle de Hain? / [assistant]: c'est une série SF / [user]: c'est plusieurs livres → {type: \"interest\", value: \"is interested in the Hain cycle\"}\n"
+    "- [user]: raconte-moi Pinocchio → {type: \"media\", value: \"listens to the story of Pinocchio\"}\n"
+    "- [user]: mets-moi de la musique de Bach → {type: \"media\", value: \"listens to Bach\"}\n"
+    "- [user]: réponds-moi plus brièvement à l'avenir → {type: \"assistant\", value: \"prefers concise responses\"}\n"
     "- [user]: oublie tout sur moi → (nothing to extract, this is a deletion command)\n"
     "- [user]: efface mes données → (nothing to extract, this is a deletion command)\n"
     "Call extract_user_facts with ALL facts found."
@@ -223,7 +254,7 @@ def _find_habits_sync(facts: list[dict], known_types: list[str]) -> list[dict]:
 
 
 def _habit_expires_at() -> str:
-    from datetime import timedelta
+    from datetime import datetime, timedelta, timezone
     return (datetime.now(timezone.utc) + timedelta(days=HABIT_TTL_DAYS)).isoformat()
 
 
@@ -290,7 +321,24 @@ async def _consolidate_habits(username: str, auth_headers: dict):
 
     known_types = sorted(set(f["type"] for f in all_facts)) or DEFAULT_FACT_TYPES
     loop = asyncio.get_event_loop()
-    habit_groups = await loop.run_in_executor(None, _find_habits_sync, candidate_facts, known_types)
+
+    # Lots homogènes par type (des faits de types différents n'ont de toute façon aucune
+    # raison d'être regroupés ensemble), puis découpés à CONSOLIDATION_BATCH_SIZE — voir le
+    # commentaire sur la constante pour le pourquoi.
+    facts_by_type: dict[str, list[dict]] = {}
+    for f in candidate_facts:
+        facts_by_type.setdefault(f["type"], []).append(f)
+    batches = [
+        facts_of_type[i:i + CONSOLIDATION_BATCH_SIZE]
+        for facts_of_type in facts_by_type.values()
+        for i in range(0, len(facts_of_type), CONSOLIDATION_BATCH_SIZE)
+    ]
+    logger.info(f"[{username}] Regroupement en {len(batches)} lot(s) de ≤{CONSOLIDATION_BATCH_SIZE} faits")
+
+    batch_results = await asyncio.gather(
+        *[loop.run_in_executor(None, _find_habits_sync, batch, known_types) for batch in batches]
+    )
+    habit_groups = [group for groups in batch_results for group in groups]
 
     if not habit_groups:
         logger.info(f"[{username}] Aucune habitude détectée")
@@ -300,18 +348,32 @@ async def _consolidate_habits(username: str, auth_headers: dict):
     facts_by_id = {f["id"]: f for f in all_facts}
 
     for habit in habit_groups:
-        valid_ids = [fid for fid in habit["fact_ids"] if fid in facts_by_id]
-        logger.info(f"[{username}] Habitude '{habit['description']}': {len(valid_ids)} faits valides sur {len(habit['fact_ids'])} proposés")
+        # Un groupe malformé (clé manquante/mauvais type — déjà vu en pratique quand le LLM
+        # part en boucle de répétition sur fact_ids jusqu'à la limite de tokens) ne doit PAS
+        # faire échouer tout le cycle en silence : sans ce try/except, une exception ici
+        # remontait hors d'une asyncio.create_task() que personne n'attend, donc jamais
+        # loggée (asyncio ne la signale qu'au garbage collection de la tâche, qui n'arrive
+        # jamais tant qu'elle reste référencée dans _consolidation_tasks) — la consolidation
+        # semblait alors juste s'arrêter net, sans aucune trace ni erreur.
+        try:
+            fact_ids = habit["fact_ids"]
+            description = habit["description"]
+            habit_type = habit["type"]
+            valid_ids = [fid for fid in fact_ids if fid in facts_by_id]
+        except (KeyError, TypeError) as e:
+            logger.error(f"[{username}] Groupe d'habitude malformé, ignoré: {e} — habit={repr(habit)[:500]}")
+            continue
+
+        logger.info(f"[{username}] Habitude '{description}': {len(valid_ids)} faits valides sur {len(fact_ids)} proposés")
         if len(valid_ids) < HABIT_THRESHOLD:
             logger.info(f"[{username}] Ignoré — moins de {HABIT_THRESHOLD} faits valides")
             continue
 
-        habit_type = habit["type"]
         is_permanent = habit_type in PERMANENT_TYPES
         expires_at = "" if is_permanent else _habit_expires_at()
 
         session_ids = list(dict.fromkeys(facts_by_id[fid]["session_id"] for fid in valid_ids))
-        logger.info(f"[{username}] Stockage habitude: type={habit_type} permanent={is_permanent} description=\"{habit['description']}\"")
+        logger.info(f"[{username}] Stockage habitude: type={habit_type} permanent={is_permanent} description=\"{description}\"")
 
         try:
             async with aiohttp.ClientSession(headers=auth_headers) as http:
@@ -345,69 +407,41 @@ def _schedule_consolidation(username: str):
     et de plus en plus coûteuses au lieu d'une seule consolidation sur l'état final."""
     existing = _consolidation_tasks.get(username)
     if existing and not existing.done():
+        if _consolidation_running.get(username):
+            # Une passe est déjà en cours d'exécution (au-delà du délai de debounce — LLM de
+            # regroupement puis stockage/suppression) : ne PAS l'annuler. Avant ce garde-fou,
+            # une discussion arrivant pendant cette fenêtre annulait la tâche en plein vol,
+            # parfois après que le LLM ait déjà identifié un groupe de faits en double (log
+            # "N habitude(s) détectée(s)"), coupant court avant le stockage de l'habitude et
+            # la suppression des faits d'origine. Résultat observé en pratique : les faits
+            # quasi-identiques s'accumulaient indéfiniment (des dizaines de doublons) sans
+            # jamais être consolidés, et search_preference devenait de plus en plus lent
+            # (il passe tous les faits d'un type au LLM de synthèse). On laisse cette passe
+            # se terminer ; la prochaine discussion en planifiera une nouvelle une fois
+            # celle-ci achevée.
+            logger.debug(f"[{username}] Consolidation déjà en cours d'exécution — nouvelle planification ignorée")
+            return
         existing.cancel()
         logger.debug(f"[{username}] Consolidation annulée (debounce)")
 
     async def _delayed():
         await asyncio.sleep(2.0)
-        auth_headers = {"Cookie": f"vk_session={_user_passwords[username]}"}
-        await _consolidate_habits(username, auth_headers)
+        _consolidation_running[username] = True
+        try:
+            auth_headers = {"Cookie": f"vk_session={_user_passwords[username]}"}
+            await _consolidate_habits(username, auth_headers)
+        except Exception as e:
+            # Filet de sécurité : la tâche créée par asyncio.create_task() n'est jamais
+            # attendue nulle part, donc une exception non catchée ici resterait invisible
+            # (asyncio ne la loggue qu'au garbage collection de la tâche, qui n'arrive pas
+            # tant qu'elle reste référencée dans _consolidation_tasks) — déjà vécu une fois
+            # avec une consolidation qui semblait juste s'arrêter net sans aucune trace.
+            logger.error(f"[{username}] Consolidation échouée (exception non gérée): {e}", exc_info=True)
+        finally:
+            _consolidation_running[username] = False
 
     _consolidation_tasks[username] = asyncio.create_task(_delayed())
     logger.info(f"[{username}] Consolidation planifiée (debounce 2s)")
-
-
-SELECT_TYPES_TOOL = [{
-    "type": "function",
-    "function": {
-        "name": "select_profile_types",
-        "description": "Select fact types that describe core personal attributes of the user.",
-        "parameters": {
-            "type": "object",
-            "properties": {
-                "types": {
-                    "type": "array",
-                    "items": {"type": "string"},
-                    "description": "Types that describe who the person IS (name, location, occupation, family, language, personality, goal, skill). Exclude pure hobby/interest types (book, music, video_game, cinema) as those are covered by habits.",
-                }
-            },
-            "required": ["types"],
-        },
-    },
-}]
-
-
-def _select_profile_types_sync(available_types: list[str]) -> list[str]:
-    if not available_types:
-        return []
-    logger.info(f"Sélection des types de profil parmi: {available_types}")
-    try:
-        client = openai.OpenAI(api_key=LLAMACPP_API_KEY, base_url=LLM_BASE_URL)
-        resp = client.chat.completions.create(
-            model=LLM_MODEL,
-            messages=[
-                {"role": "system", "content": (
-                    "Select the fact types from the provided list that describe core personal attributes (name, location, occupation, family, language, personality, goal, skill). "
-                    "Exclude pure hobby/interest types (book, music, video_game, cinema, sport, food) — those are covered by habits. "
-                    "Call select_profile_types with the relevant types."
-                )},
-                {"role": "user", "content": f"Available types: {', '.join(available_types)}"},
-            ],
-            tools=SELECT_TYPES_TOOL,
-            tool_choice="required",
-        )
-        tool_calls = resp.choices[0].message.tool_calls
-        if not tool_calls:
-            return []
-        result = json.loads(tool_calls[0].function.arguments).get("types", [])
-        # Always include "name" if it exists — it's the most fundamental personal attribute
-        if "name" in available_types and "name" not in result:
-            result = ["name"] + result
-        logger.info(f"Types de profil sélectionnés: {result}")
-        return result
-    except Exception as e:
-        logger.error(f"Sélection des types de profil échouée: {e}")
-        return []
 
 
 def _select_search_types_sync(query: str, available_types: list[str]) -> list[str]:
@@ -642,23 +676,13 @@ def _synthesize_search_sync(query: str, facts: list[dict]) -> str:
 
 async def _generate_profile(username: str, auth_headers: dict, nexus, profile_topic: str):
     logger.info(f"[{username}] Génération du profil...")
-    try:
-        async with aiohttp.ClientSession(headers=auth_headers) as http:
-            resp = await http.get(f"{MNEMONIC_URL}/users/{username}/facts/types")
-            resp.raise_for_status()
-            available_types = (await resp.json()).get("types", [])
-    except Exception as e:
-        logger.error(f"[{username}] Échec récupération types pour profil: {e}")
-        return
-
-    logger.info(f"[{username}] Types disponibles: {available_types}")
-    if not available_types:
-        logger.info(f"[{username}] Aucun type disponible, profil ignoré")
-        return
-
     loop = asyncio.get_event_loop()
-    profile_types = await loop.run_in_executor(None, _select_profile_types_sync, available_types)
-    logger.info(f"[{username}] Types retenus pour faits personnels: {profile_types}")
+
+    # Avec la taxonomie fermée, les faits qui décrivent qui EST la personne (par
+    # opposition à ses habitudes) sont toujours exactement PERMANENT_TYPES ('personal') —
+    # plus besoin d'un appel LLM pour le deviner parmi une liste de types dynamique comme
+    # à l'époque de l'ancienne taxonomie ouverte.
+    profile_types = sorted(PERMANENT_TYPES)
 
     personal_facts = []
     habits = []
@@ -914,10 +938,16 @@ async def on_user_connected(topic: str, payload):
         available_types = await _fetch_known_types(username, {"Cookie": f"vk_session={_user_passwords[username]}"})
         logger.info(f"[{username}] Types disponibles: {available_types}")
 
-        # 2. LLM selects relevant types for this query
+        # 2. LLM selects relevant types for this query — sans type sélectionné (question
+        # trop large pour cibler, ex: "que sais-tu sur moi ?"), chercher sur tous les types
+        # disponibles plutôt que de se rabattre uniquement sur la recherche sémantique : avec
+        # seulement 5 catégories fixes désormais, interroger les 5 ne coûte rien et garantit
+        # de ne rater aucune donnée par excès de prudence du sélecteur.
         selected_types = await loop.run_in_executor(
             None, _select_search_types_sync, query, available_types
         )
+        if not selected_types:
+            selected_types = available_types
         logger.info(f"[{username}] Types retenus pour la recherche: {selected_types}")
 
         # 3. Fetch facts by type; fall back to semantic search if no types matched

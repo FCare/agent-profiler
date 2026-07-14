@@ -835,11 +835,10 @@ async def on_user_connected(topic: str, payload):
                 {
                     "topic": search_topic,
                     "description": (
-                        "Recherche dans la mémoire de l'utilisateur. "
-                        "Utiliser quand l'utilisateur pose une question sur ses propres données, préférences ou habitudes "
-                        "(ex: 'quels sont mes lieux habituels ?', 'est-ce que j'aime le jazz ?'), "
-                        "ou quand une réponse nécessite une information personnelle avant d'agir "
-                        "(ex: 'météo de mes lieux habituels' → chercher 'lieux habituels' AVANT de répondre)."
+                        "Recherche dans la mémoire de l'utilisateur (données/préférences/habitudes "
+                        "propres, ex: 'mes lieux habituels', 'est-ce que j'aime le jazz'), y compris "
+                        "comme étape préalable avant une autre action (ex: 'météo de mes lieux "
+                        "habituels' → chercher d'abord 'lieux habituels')."
                     ),
                     "access": "write",
                     "response_topic": search_results_topic,
@@ -848,14 +847,10 @@ async def on_user_connected(topic: str, payload):
                 {
                     "topic": delete_topic,
                     "description": (
-                        "Supprime des faits mémorisés. "
-                        "Utiliser quand l'utilisateur (1) demande explicitement de supprimer/effacer/oublier quelque chose, "
-                        "OU (2) déclare clairement qu'il ne s'intéresse plus à quelque chose "
-                        "(ex: 'la météo ne m'intéresse plus', 'je n'aime plus le retro gaming'). "
-                        "NE PAS utiliser si c'est un commentaire passager dans une demande d'action "
-                        "(ex: 'donne-moi la météo' ne doit PAS déclencher une suppression). "
-                        "Pour effacer TOUTE la mémoire (ex: 'oublie tout', 'efface tout ce que tu sais sur moi'), "
-                        "utiliser clear_all=true."
+                        "Supprime des faits mémorisés — demande explicite (supprimer/effacer/oublier) "
+                        "OU déclaration de désintérêt (ex: 'la météo ne m'intéresse plus'). PAS pour un "
+                        "commentaire passager dans une demande d'action ('donne-moi la météo' ne "
+                        "supprime rien). clear_all=true pour tout effacer ('oublie tout')."
                     ),
                     "access": "write",
                     "response_topic": delete_results_topic,

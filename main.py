@@ -3,6 +3,7 @@ import json
 import logging
 import os
 import sys
+import time
 
 import aiohttp
 import httpx
@@ -51,6 +52,36 @@ async def _new_nexus_client() -> NexusClient:
         AUTHENTIK_URL, MQTT_HOST, access_token,
         AUTHENTIK_CLIENT_ID, AUTHENTIK_CLIENT_SECRET, MQTT_PORT,
     )
+
+
+_cached_mnemonic_token: tuple[str, float] | None = None  # (access_token, expiry_epoch)
+
+
+async def _mnemonic_auth_headers() -> dict:
+    """Authorization: Bearer <token Authentik> pour les appels HTTP à mnemonic —
+    remplace le cookie vk_session de l'utilisateur (plus disponible : mnemonic
+    accepte désormais directement l'identité de service profiler-client, voir
+    mnemonic/main.py::require_auth). Token mis en cache jusqu'à peu avant
+    expiration plutôt que refait à chaque appel (mnemonic est interrogé très
+    fréquemment)."""
+    global _cached_mnemonic_token
+    if _cached_mnemonic_token and _cached_mnemonic_token[1] > time.time() + 30:
+        return {"Authorization": f"Bearer {_cached_mnemonic_token[0]}"}
+    async with httpx.AsyncClient(timeout=10.0) as client:
+        resp = await client.post(
+            f"{AUTHENTIK_URL}/application/o/token/",
+            data={
+                "grant_type": "client_credentials",
+                "client_id": AUTHENTIK_CLIENT_ID,
+                "client_secret": AUTHENTIK_CLIENT_SECRET,
+            },
+        )
+        if resp.status_code != 200:
+            logger.error(f"Échec obtention token OAuth (mnemonic): {resp.status_code} {resp.text}")
+            raise RuntimeError("Cannot get OAuth token")
+        data = resp.json()
+    _cached_mnemonic_token = (data["access_token"], time.time() + data.get("expires_in", 3600))
+    return {"Authorization": f"Bearer {_cached_mnemonic_token[0]}"}
 LLAMACPP_API_KEY = os.environ["LLAMACPP_API_KEY"]
 HABIT_THRESHOLD = int(os.environ.get("HABIT_THRESHOLD", "5"))
 # Un seul appel LLM sur tout le backlog de faits candidats (ex: 241 faits observés en
@@ -68,7 +99,6 @@ PERMANENT_TYPES = {"personal"}
 
 _subscribed_users: set[str] = set()   # per-user: discussions subscription
 _subscribed_sessions: set[str] = set()  # per-session: search/delete subscriptions
-_user_passwords: dict[str, str] = {}  # username → current session cookie (refreshed on each reconnect)
 _user_nexus: dict[str, object] = {}   # username → shared nexus for per-user subscriptions
 _profile_tasks: dict[str, asyncio.Task] = {}  # username → pending debounced profile task
 _consolidation_tasks: dict[str, asyncio.Task] = {}  # username → pending debounced consolidation task
@@ -456,7 +486,7 @@ def _schedule_consolidation(username: str):
         await asyncio.sleep(2.0)
         _consolidation_running[username] = True
         try:
-            auth_headers = {"Cookie": f"vk_session={_user_passwords[username]}"}
+            auth_headers = await _mnemonic_auth_headers()
             await _consolidate_habits(username, auth_headers)
         except Exception as e:
             # Filet de sécurité : la tâche créée par asyncio.create_task() n'est jamais
@@ -753,7 +783,7 @@ def _schedule_profile_generation(username: str, nexus, profile_topic: str):
 
     async def _delayed():
         await asyncio.sleep(0.5)
-        auth_headers = {"Cookie": f"vk_session={_user_passwords[username]}"}
+        auth_headers = await _mnemonic_auth_headers()
         await _generate_profile(username, auth_headers, nexus, profile_topic)
 
     _profile_tasks[username] = asyncio.create_task(_delayed())
@@ -776,15 +806,15 @@ def _normalize_messages(payload: list) -> list:
     return normalized
 
 
-async def on_discussion(username: str, topic: str, payload, user_api_key: str, nexus, profile_topic: str):
+async def on_discussion(username: str, topic: str, payload, nexus, profile_topic: str):
     if not isinstance(payload, list) or not payload:
         return
 
     logger.info(f"[{username}] Discussion reçue ({len(payload)} messages)")
 
-    auth_headers = {"Cookie": f"vk_session={user_api_key}"}
+    auth_headers = await _mnemonic_auth_headers()
     sessions_url = f"{MNEMONIC_URL}/users/{username}/sessions"
-    logger.info(f"[{username}] POST {sessions_url} — Cookie: vk_session={user_api_key}")
+    logger.info(f"[{username}] POST {sessions_url}")
 
     normalized = _normalize_messages(payload)
     if not normalized:
@@ -926,20 +956,13 @@ async def on_user_connected(topic: str, payload):
     )
     logger.info(f"[{username}/{session_id}] Topics déclarés sur {agent_topics_topic}")
 
-    # Le vrai cookie de session VK n'arrive plus ici (common/user_connected ne
-    # diffuse qu'un booléen "authenticated" depuis le fix de fuite de credentials) —
-    # il est reçu séparément via le canal dédié credentials_topic ci-dessous,
-    # asynchrone par rapport à ce point. La clé est initialisée à None pour éviter un
-    # KeyError si un appel mémoire arrive avant que ce message ne soit traité.
-    _user_passwords.setdefault(username, None)
-
     # Per-user: subscribe to discussions only once
     if username not in _subscribed_users:
         _subscribed_users.add(username)
         logger.info(f"Nouvel utilisateur: {username} — discussions={discussions_topic}")
 
         async def handler(t, p):
-            await on_discussion(username, t, p, _user_passwords[username], nexus, profile_topic)
+            await on_discussion(username, t, p, nexus, profile_topic)
 
         nexus.subscribe(discussions_topic, handler)
 
@@ -951,24 +974,6 @@ async def on_user_connected(topic: str, payload):
 
     _subscribed_sessions.add(session_id)
     logger.info(f"[{username}/{session_id}] Nouvelle session — abonnement search/delete")
-
-    # Cookie de session VK réel, transmis uniquement à ce canal dédié (ACL
-    # mosquitto-auth-authentik restreinte à profiler-client en lecture) — voir
-    # mqtt_write.py côté panoramix/joshua. Nécessaire pour interroger Voight-Kampff
-    # au nom de l'utilisateur (faits mémorisés, habitudes...).
-    credentials_topic = f"users/{username}/{session_id}/profiler/credentials"
-
-    async def on_credentials(t, p):
-        if isinstance(p, dict) and p.get("vk_session"):
-            _user_passwords[username] = p["vk_session"]
-            logger.info(f"[{username}] Cookie de session VK reçu sur {credentials_topic}")
-            # Efface immédiatement le message retenu (publish vide, retain=True) —
-            # panoramix doit publier en retain pour éviter une course avec cet abonnement
-            # (voir mqtt_write.py), mais rien ne doit laisser le cookie sur le broker
-            # au-delà du temps nécessaire à cette lecture.
-            await nexus.publish(credentials_topic, None, retain=True)
-
-    nexus.subscribe(credentials_topic, on_credentials)
 
     async def on_search_request(t, p):
         if not isinstance(p, dict):
@@ -992,7 +997,7 @@ async def on_user_connected(topic: str, payload):
         loop = asyncio.get_event_loop()
 
         # 1. Fetch available types
-        available_types = await _fetch_known_types(username, {"Cookie": f"vk_session={_user_passwords[username]}"})
+        available_types = await _fetch_known_types(username, await _mnemonic_auth_headers())
         logger.info(f"[{username}] Types disponibles: {available_types}")
 
         # 2. LLM selects relevant types for this query — sans type sélectionné (question
@@ -1011,7 +1016,7 @@ async def on_user_connected(topic: str, payload):
         facts = []
         if selected_types:
             try:
-                async with aiohttp.ClientSession(headers={"Cookie": f"vk_session={_user_passwords[username]}"}) as http:
+                async with aiohttp.ClientSession(headers=await _mnemonic_auth_headers()) as http:
                     for fact_type in selected_types:
                         resp = await http.get(
                             f"{MNEMONIC_URL}/users/{username}/facts",
@@ -1026,7 +1031,7 @@ async def on_user_connected(topic: str, payload):
         if not facts:
             logger.info(f"[{username}] Fallback sur la recherche sémantique")
             try:
-                async with aiohttp.ClientSession(headers={"Cookie": f"vk_session={_user_passwords[username]}"}) as http:
+                async with aiohttp.ClientSession(headers=await _mnemonic_auth_headers()) as http:
                     resp = await http.get(
                         f"{MNEMONIC_URL}/users/{username}/facts/search",
                         params={"q": query, "n": n},
@@ -1069,7 +1074,7 @@ async def on_user_connected(topic: str, payload):
         if clear_all:
             logger.info(f"[{username}] Suppression totale de la mémoire")
             try:
-                async with aiohttp.ClientSession(headers={"Cookie": f"vk_session={_user_passwords[username]}"}) as http:
+                async with aiohttp.ClientSession(headers=await _mnemonic_auth_headers()) as http:
                     resp = await http.delete(f"{MNEMONIC_URL}/users/{username}/facts")
                     resp.raise_for_status()
                     result = await resp.json()
@@ -1080,7 +1085,7 @@ async def on_user_connected(topic: str, payload):
                 logger.error(f"[{username}] Échec suppression totale: {e}")
         elif ids:
             logger.info(f"[{username}] Suppression par ids: {ids}")
-            async with aiohttp.ClientSession(headers={"Cookie": f"vk_session={_user_passwords[username]}"}) as http:
+            async with aiohttp.ClientSession(headers=await _mnemonic_auth_headers()) as http:
                 for fact_id in ids:
                     try:
                         resp = await http.delete(f"{MNEMONIC_URL}/users/{username}/facts/{fact_id}")
@@ -1095,7 +1100,7 @@ async def on_user_connected(topic: str, payload):
             loop = asyncio.get_event_loop()
 
             # 1. Find directly relevant types for this query (strict, max 2)
-            available_types = await _fetch_known_types(username, {"Cookie": f"vk_session={_user_passwords[username]}"})
+            available_types = await _fetch_known_types(username, await _mnemonic_auth_headers())
             selected_types = await loop.run_in_executor(
                 None, _select_deletion_types_sync, query, available_types
             )
@@ -1105,7 +1110,7 @@ async def on_user_connected(topic: str, payload):
             candidates = []
             if selected_types:
                 try:
-                    async with aiohttp.ClientSession(headers={"Cookie": f"vk_session={_user_passwords[username]}"}) as http:
+                    async with aiohttp.ClientSession(headers=await _mnemonic_auth_headers()) as http:
                         for fact_type in selected_types:
                             resp = await http.get(
                                 f"{MNEMONIC_URL}/users/{username}/facts",
@@ -1137,7 +1142,7 @@ async def on_user_connected(topic: str, payload):
 
             # 4. Delete only the filtered facts, collecting associated session_ids
             session_ids_to_delete = set()
-            async with aiohttp.ClientSession(headers={"Cookie": f"vk_session={_user_passwords[username]}"}) as http:
+            async with aiohttp.ClientSession(headers=await _mnemonic_auth_headers()) as http:
                 for fact_id in ids_to_delete:
                     try:
                         resp = await http.delete(f"{MNEMONIC_URL}/users/{username}/facts/{fact_id}")
@@ -1153,7 +1158,7 @@ async def on_user_connected(topic: str, payload):
 
             # 5. Delete associated sessions
             if session_ids_to_delete:
-                async with aiohttp.ClientSession(headers={"Cookie": f"vk_session={_user_passwords[username]}"}) as http:
+                async with aiohttp.ClientSession(headers=await _mnemonic_auth_headers()) as http:
                     for mnemonic_sid in session_ids_to_delete:
                         try:
                             resp = await http.delete(f"{MNEMONIC_URL}/users/{username}/sessions/{mnemonic_sid}")

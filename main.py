@@ -5,6 +5,7 @@ import os
 import sys
 
 import aiohttp
+import httpx
 import openai
 from nexus_client import NexusClient
 
@@ -15,14 +16,41 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-VK_URL = os.environ["VK_URL"]
 MQTT_HOST = os.environ["MQTT_HOST"]
 MQTT_PORT = int(os.environ.get("MQTT_PORT", "1883"))
-SERVICE_USERNAME = os.environ["MQTT_SERVICE_USERNAME"]
-SERVICE_API_KEY = os.environ["MQTT_SERVICE_API_KEY"]
+# Authentik OAuth (client credentials) — remplace l'ancienne clé API statique
+# MQTT_SERVICE_API_KEY, rejetée par mosquitto-auth-authentik qui exige un vrai JWT
+# Authentik (voir _new_nexus_client ci-dessous, même pattern qu'agent-news/wiki-agent).
+AUTHENTIK_URL = os.environ.get("AUTHENTIK_URL", "https://sso.caronboulme.fr")
+AUTHENTIK_CLIENT_ID = os.environ["AUTHENTIK_CLIENT_ID"]
+AUTHENTIK_CLIENT_SECRET = os.environ["AUTHENTIK_CLIENT_SECRET"]
 MNEMONIC_URL = os.environ["MNEMONIC_URL"]
 LLM_BASE_URL = os.environ.get("LLM_BASE_URL", "https://thebrain.caronboulme.fr/v1")
 LLM_MODEL = os.environ.get("LLM_MODEL", "qwen3-vl-8b-instruct")
+
+
+async def _new_nexus_client() -> NexusClient:
+    """Obtient un token OAuth Client Credentials via Authentik et construit un
+    NexusClient authentifié — mosquitto-auth-authentik valide le mot de passe MQTT
+    comme un JWT Authentik, un token frais est donc nécessaire à chaque connexion."""
+    async with httpx.AsyncClient(timeout=10.0) as client:
+        resp = await client.post(
+            f"{AUTHENTIK_URL}/application/o/token/",
+            data={
+                "grant_type": "client_credentials",
+                "client_id": AUTHENTIK_CLIENT_ID,
+                "client_secret": AUTHENTIK_CLIENT_SECRET,
+            },
+        )
+        if resp.status_code != 200:
+            logger.error(f"Échec obtention token OAuth: {resp.status_code} {resp.text}")
+            raise RuntimeError("Cannot get OAuth token")
+        access_token = resp.json()["access_token"]
+
+    return await NexusClient.from_authentik_token(
+        AUTHENTIK_URL, MQTT_HOST, access_token,
+        AUTHENTIK_CLIENT_ID, AUTHENTIK_CLIENT_SECRET, MQTT_PORT,
+    )
 LLAMACPP_API_KEY = os.environ["LLAMACPP_API_KEY"]
 HABIT_THRESHOLD = int(os.environ.get("HABIT_THRESHOLD", "5"))
 # Un seul appel LLM sur tout le backlog de faits candidats (ex: 241 faits observés en
@@ -815,11 +843,11 @@ async def on_user_connected(topic: str, payload):
         return
 
     username = payload.get("username")
-    password = payload.get("password")
+    authenticated = payload.get("authenticated")
     session_id = payload.get("session_id")
     private_topics = payload.get("private_topics", [])
 
-    if not username or not password or not session_id:
+    if not username or not authenticated or not session_id:
         return
 
     discussions_topic = _find_topic(private_topics, "discussions")
@@ -840,7 +868,7 @@ async def on_user_connected(topic: str, payload):
 
     # Reuse per-user nexus for discussions (avoid duplicate subscriptions across sessions)
     if username not in _user_nexus:
-        _user_nexus[username] = NexusClient.from_api_key(VK_URL, MQTT_HOST, SERVICE_USERNAME, SERVICE_API_KEY, MQTT_PORT)
+        _user_nexus[username] = await _new_nexus_client()
     nexus = _user_nexus[username]
 
     # Always republish topic declaration so agents that restarted can rediscover it.
@@ -898,9 +926,12 @@ async def on_user_connected(topic: str, payload):
     )
     logger.info(f"[{username}/{session_id}] Topics déclarés sur {agent_topics_topic}")
 
-    # Always refresh the password — cookie expires after 24h
-    _user_passwords[username] = password
-    logger.info(f"[{username}] Cookie de session mis à jour")
+    # Le vrai cookie de session VK n'arrive plus ici (common/user_connected ne
+    # diffuse qu'un booléen "authenticated" depuis le fix de fuite de credentials) —
+    # il est reçu séparément via le canal dédié credentials_topic ci-dessous,
+    # asynchrone par rapport à ce point. La clé est initialisée à None pour éviter un
+    # KeyError si un appel mémoire arrive avant que ce message ne soit traité.
+    _user_passwords.setdefault(username, None)
 
     # Per-user: subscribe to discussions only once
     if username not in _subscribed_users:
@@ -921,14 +952,40 @@ async def on_user_connected(topic: str, payload):
     _subscribed_sessions.add(session_id)
     logger.info(f"[{username}/{session_id}] Nouvelle session — abonnement search/delete")
 
+    # Cookie de session VK réel, transmis uniquement à ce canal dédié (ACL
+    # mosquitto-auth-authentik restreinte à profiler-client en lecture) — voir
+    # mqtt_write.py côté panoramix/joshua. Nécessaire pour interroger Voight-Kampff
+    # au nom de l'utilisateur (faits mémorisés, habitudes...).
+    credentials_topic = f"users/{username}/{session_id}/profiler/credentials"
+
+    async def on_credentials(t, p):
+        if isinstance(p, dict) and p.get("vk_session"):
+            _user_passwords[username] = p["vk_session"]
+            logger.info(f"[{username}] Cookie de session VK reçu sur {credentials_topic}")
+            # Efface immédiatement le message retenu (publish vide, retain=True) —
+            # panoramix doit publier en retain pour éviter une course avec cet abonnement
+            # (voir mqtt_write.py), mais rien ne doit laisser le cookie sur le broker
+            # au-delà du temps nécessaire à cette lecture.
+            await nexus.publish(credentials_topic, None, retain=True)
+
+    nexus.subscribe(credentials_topic, on_credentials)
+
     async def on_search_request(t, p):
         if not isinstance(p, dict):
+            logger.warning(f"[{username}] search_preference: payload invalide (pas un objet): {p!r}")
+            await nexus.publish(search_results_topic, {"error": "invalid payload: expected an object"})
             return
         # Normalize keys: Gemma4 sometimes generates escaped quotes around key names
         p = {k.strip('"'): v for k, v in p.items()}
         query = p.get("query", "")
         n = int(p.get("n", 5))
         if not query:
+            # Ne JAMAIS rester silencieux sur une requête malformée : sans réponse
+            # sur search_results_topic, l'appelant (ex: MqttWriteTool côté panoramix/
+            # joshua) reste bloqué indéfiniment en attente d'un résultat qui ne
+            # viendra jamais - toujours répondre, même pour signaler une erreur.
+            logger.warning(f"[{username}] search_preference: query manquant")
+            await nexus.publish(search_results_topic, {"query": query, "error": "query is mandatory"})
             return
         logger.info(f"[{username}] Recherche de faits: {query!r} (n={n})")
 
@@ -979,6 +1036,7 @@ async def on_user_connected(topic: str, payload):
                 logger.info(f"[{username}] Mnemonic résultats sémantiques ({len(facts)}): {facts}")
             except Exception as e:
                 logger.error(f"[{username}] Échec recherche sémantique: {e}")
+                await nexus.publish(search_results_topic, {"query": query, "error": f"search failed: {e}"})
                 return
 
         # 4. LLM synthesizes a focused answer
@@ -989,12 +1047,21 @@ async def on_user_connected(topic: str, payload):
 
     async def on_delete_request(t, p):
         if not isinstance(p, dict):
+            logger.warning(f"[{username}] delete_facts: payload invalide (pas un objet): {p!r}")
+            await nexus.publish(delete_results_topic, {"error": "invalid payload: expected an object"})
             return
         p = {k.strip('"'): v for k, v in p.items()}
         ids = p.get("ids")
         query = p.get("query", "")
         clear_all = p.get("clear_all", False)
         if not ids and not query and not clear_all:
+            # Même principe que on_search_request : toujours répondre, jamais
+            # laisser l'appelant bloqué sans réponse sur une requête malformée.
+            logger.warning(f"[{username}] delete_facts: ni ids, ni query, ni clear_all fourni")
+            await nexus.publish(
+                delete_results_topic,
+                {"error": "one of ids, query, or clear_all is mandatory"},
+            )
             return
 
         deleted_labels = []
@@ -1108,7 +1175,7 @@ async def on_user_connected(topic: str, payload):
 
 
 async def main():
-    nexus = NexusClient.from_api_key(VK_URL, MQTT_HOST, SERVICE_USERNAME, SERVICE_API_KEY, MQTT_PORT)
+    nexus = await _new_nexus_client()
     nexus.subscribe("common/user_connected", on_user_connected)
     nexus.start_listening()
     logger.info("Profiler démarré — écoute common/user_connected")
